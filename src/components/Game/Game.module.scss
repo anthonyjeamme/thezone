@@ -1,0 +1,517 @@
+.Game {
+  position: fixed;
+  inset: 0;
+  background-color: #25643f;
+
+  canvas {
+    width: 100%;
+    height: 100%;
+  }
+}
+
+.RendererContainer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+}
+
+// --- Stats bar ---
+
+.StatsBar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 8px 16px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 600;
+  z-index: 5;
+}
+
+.StatItem {
+  opacity: 0.7;
+}
+
+.SpeedControls {
+  display: flex;
+  gap: 4px;
+  margin-left: 8px;
+  padding-left: 12px;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.SpeedBtn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.5);
+  font-family: monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #fff;
+  }
+
+  &.active {
+    background: rgba(255, 255, 255, 0.2);
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.3);
+  }
+}
+
+// --- Inventory panel ---
+
+.InventoryPanel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: scroll;
+  padding-right: 6px;
+  scrollbar-width: thin;
+  bottom: 12px;
+}
+
+.InventoryCard {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-width: 200px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+
+  &:hover {
+    border-color: rgba(255, 255, 255, 0.25);
+  }
+
+  &.focused {
+    border-color: rgba(255, 255, 255, 0.4);
+    background: rgba(255, 255, 255, 0.12);
+  }
+}
+
+.InventoryHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.InventoryDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.InventoryAge {
+  opacity: 0.4;
+  font-weight: 400;
+  font-size: 10px;
+}
+
+.InventoryState {
+  margin-left: auto;
+  opacity: 0.4;
+  font-weight: 400;
+  font-size: 11px;
+}
+
+// --- Needs ---
+
+.NeedsSection {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+
+.NeedBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.NeedBarLabel {
+  font-size: 9px;
+  opacity: 0.4;
+  text-transform: uppercase;
+  width: 46px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.NeedBarTrack {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.NeedBarFill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+
+.NeedBarValue {
+  font-size: 9px;
+  opacity: 0.35;
+  width: 20px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+// --- Reproduction ---
+
+.InventorySex {
+  font-size: 14px;
+  opacity: 0.6;
+  line-height: 1;
+}
+
+.ReproInfo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.ReproLabel {
+  font-size: 9px;
+  opacity: 0.5;
+  text-transform: uppercase;
+  width: 56px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.ReproValue {
+  font-size: 10px;
+  opacity: 0.5;
+}
+
+// --- Inventory ---
+
+.InventorySection {
+  margin-bottom: 4px;
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+}
+
+.InventoryLabel {
+  display: block;
+  font-size: 10px;
+  opacity: 0.35;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.InventoryItems {
+  display: grid;
+  grid-template-columns: repeat(20, 1fr);
+  gap: 4px;
+  width: 316px;
+}
+
+.InventoryEmpty {
+  opacity: 0.25;
+  font-style: italic;
+  font-size: 11px;
+}
+
+.InventoryItemDot {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+// --- Focus panel (left side) ---
+
+.FocusPanel {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  bottom: 12px;
+  width: 260px;
+  background: rgba(10, 10, 15, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 14px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  z-index: 10;
+}
+
+.FocusPanelHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.FocusPanelName {
+  flex: 1;
+}
+
+.FocusPanelClose {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  transition: all 0.15s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+  }
+}
+
+// --- Detail panel (content inside focus panel) ---
+
+.DetailPanel {
+  cursor: default;
+}
+
+.DetailSection {
+  margin-bottom: 8px;
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+}
+
+.DetailSectionTitle {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  opacity: 0.45;
+  margin-bottom: 5px;
+  font-weight: 600;
+}
+
+.DetailEmpty {
+  opacity: 0.25;
+  font-style: italic;
+  font-size: 11px;
+}
+
+// --- Traits grid ---
+
+.TraitGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+}
+
+.TraitItem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.TraitLabel {
+  font-size: 10px;
+  opacity: 0.4;
+}
+
+.TraitValue {
+  font-size: 10px;
+  opacity: 0.7;
+  font-weight: 600;
+}
+
+// --- Relations ---
+
+.RelationRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.RelationIcon {
+  font-size: 8px;
+}
+
+.RelationName {
+  opacity: 0.7;
+}
+
+.RelationType {
+  margin-left: auto;
+  font-size: 9px;
+  opacity: 0.35;
+  text-transform: uppercase;
+}
+
+// --- Hoverable rows ---
+
+.hoverable {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin-left: -4px;
+  margin-right: -4px;
+  transition: background 0.12s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+}
+
+// --- Affinity rows ---
+
+.AffinityRow,
+.ZoneRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.AffinityDot,
+.ZoneDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.AffinityName,
+.ZoneType {
+  flex-shrink: 0;
+  opacity: 0.7;
+  font-size: 10px;
+}
+
+.ZoneSource {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.AffinityBarTrack {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.AffinityBarFill {
+  height: 100%;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.45);
+  transition: width 0.2s ease;
+}
+
+.AffinityValue {
+  font-size: 9px;
+  opacity: 0.35;
+  width: 20px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+// --- Renderer toggle (bottom center) ---
+
+.RendererToggle {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+}
+
+.RendererToggleBtn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 10, 20, 0.75);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 24px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 10px 24px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  letter-spacing: 0.5px;
+
+  &:hover {
+    background: rgba(30, 30, 50, 0.9);
+    border-color: rgba(255, 255, 255, 0.35);
+    transform: scale(1.05);
+    box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
+  }
+
+  &:active {
+    transform: scale(0.97);
+  }
+}
+
+.RendererToggleHint {
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.45;
+}
+
+// --- Job badge ---
+
+.InventoryJob {
+  font-size: 9px;
+  opacity: 0.5;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
