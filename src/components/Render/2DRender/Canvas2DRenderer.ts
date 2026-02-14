@@ -4,7 +4,7 @@
 // =============================================================
 
 import { GameRenderer, registerRenderer, SoilOverlay } from '../GameRenderer';
-import { BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, Highlight, LifeStage, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity, getCalendar, getLifeStage } from '../../World/types';
+import { BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity, Highlight, LifeStage, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity, getCalendar, getLifeStage } from '../../World/types';
 import { getSpecies } from '../../World/flora';
 import { Vector2D } from '../../Shared/vector';
 import { GESTATION_DURATION } from '../../World/reproduction';
@@ -86,6 +86,9 @@ class Canvas2DRenderer implements GameRenderer {
         });
         scene.entities.forEach((entity) => {
             if (entity.type === 'plant') renderPlant(ctx, entity);
+        });
+        scene.entities.forEach((entity) => {
+            if (entity.type === 'fruit') renderFruit(ctx, entity);
         });
         scene.entities.forEach((entity) => {
             if (entity.type === 'resource') renderResource(ctx, entity);
@@ -526,6 +529,31 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
             ctx.restore();
         }
         ctx.fill();
+    } else if (species.id === 'raspberry') {
+        // Raspberry bush: rounded bushy shape
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.85;
+        // Main bush body — wide low oval
+        ctx.beginPath();
+        ctx.ellipse(x, y, size * 0.7, size * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Darker center for depth
+        ctx.fillStyle = species.matureColor;
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        ctx.ellipse(x, y + size * 0.1, size * 0.4, size * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Small berry dots if mature
+        if (plant.growth > 0.75) {
+            ctx.fillStyle = '#C2185B';
+            ctx.globalAlpha = 0.9;
+            const berryOffsets = [[-0.3, -0.2], [0.25, -0.1], [0, 0.2], [-0.15, 0.1], [0.3, 0.15]];
+            for (const [ox, oy] of berryOffsets) {
+                ctx.beginPath();
+                ctx.arc(x + size * ox, y + size * oy, 1.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
     } else if (species.id === 'wheat') {
         // Wheat stalk
         ctx.strokeStyle = color;
@@ -553,6 +581,35 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
         ctx.arc(x, y, size * 0.2, 0, Math.PI * 2);
         ctx.fill();
     }
+
+    ctx.restore();
+}
+
+// --- Fruit rendering ---
+
+function renderFruit(ctx: CanvasRenderingContext2D, fruit: FruitEntity) {
+    const { x, y } = fruit.position;
+
+    // Fade out as fruit rots (last 30% of life)
+    const lifeRatio = 1 - fruit.age / fruit.maxAge;
+    const fadeStart = 0.3;
+    const alpha = lifeRatio < fadeStart ? lifeRatio / fadeStart : 1;
+
+    ctx.save();
+    ctx.globalAlpha = alpha * 0.9;
+
+    // Small colored circle
+    ctx.fillStyle = fruit.color;
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Tiny highlight dot
+    ctx.fillStyle = '#fff';
+    ctx.globalAlpha = alpha * 0.4;
+    ctx.beginPath();
+    ctx.arc(x - 0.8, y - 0.8, 1, 0, Math.PI * 2);
+    ctx.fill();
 
     ctx.restore();
 }

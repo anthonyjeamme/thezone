@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GameRenderer, registerRenderer } from '../GameRenderer';
 import {
-    BuildingEntity, Camera, CorpseEntity, FertileZoneEntity,
+    BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity,
     Highlight, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity,
     getCalendar, getLifeStage, LifeStage,
 } from '../../World/types';
@@ -39,6 +39,24 @@ const SOIL_OVERLAY_COLORS: Record<SoilProperty, { r0: number; g0: number; b0: nu
 // --- NPC sizes by life stage ---
 const NPC_HEIGHT: Record<LifeStage, number> = { baby: 0.4, child: 0.7, adolescent: 1.0, adult: 1.2 };
 const NPC_WIDTH: Record<LifeStage, number> = { baby: 0.25, child: 0.35, adolescent: 0.4, adult: 0.45 };
+
+// =============================================================
+//  INSTANCED RENDERING — shared types & temp objects
+// =============================================================
+
+/** A single visual part of a plant template (e.g., trunk, crown) */
+type PlantPartDef = {
+    geo: THREE.BufferGeometry;
+    mat: THREE.MeshLambertMaterial;
+    offsetY: number; // local Y offset from plant base (before instance scale)
+};
+
+// Reusable temp objects to avoid GC pressure (never create these in a loop)
+const _mat4 = new THREE.Matrix4();
+const _pos3 = new THREE.Vector3();
+const _quat = new THREE.Quaternion(); // identity
+const _scl3 = new THREE.Vector3();
+const _col3 = new THREE.Color();
 
 // =============================================================
 //  MINECRAFT-STYLE CHARACTER BUILDER
@@ -282,7 +300,12 @@ class ThreeRenderer implements GameRenderer {
     private corpseMeshes = new Map<string, THREE.Mesh>();
     private zoneMeshes = new Map<string, THREE.Mesh>();
     private stockLabels = new Map<string, THREE.Sprite>();
-    private plantMeshes = new Map<string, THREE.Group>();
+    // Instanced rendering pools
+    private plantPartCache = new Map<string, PlantPartDef[]>();
+    private plantInstances = new Map<string, THREE.InstancedMesh>();
+    private fruitGeo: THREE.SphereGeometry | null = null;
+    private fruitMatCache = new Map<string, THREE.MeshLambertMaterial>();
+    private fruitInstances = new Map<string, THREE.InstancedMesh>();
     private highlightMesh: THREE.Mesh | null = null;
 
     // Ground
@@ -297,6 +320,16 @@ class ThreeRenderer implements GameRenderer {
     private waterTexture: THREE.CanvasTexture | null = null;
     private waterUpdateTimer = 0;
     private static readonly WATER_UPDATE_INTERVAL = 500; // ms between water mesh updates
+    // Grass chunk system — streams grass around camera
+    private grassChunks = new Map<string, { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh }>();
+    private grassMat: THREE.MeshLambertMaterial | null = null;
+    private grassPlaneGeo: THREE.PlaneGeometry | null = null;
+    private grassLastCamX = Infinity;
+    private grassLastCamZ = Infinity;
+    private static readonly GRASS_CHUNK_SIZE = 60;    // world units per chunk
+    private static readonly GRASS_RENDER_RADIUS = 250; // world units — chunks within this radius
+    private static readonly GRASS_STEP = 0.7;          // world units between patches
+    private static readonly GRASS_FADE_START = 0.7;    // start fading at 70% of render radius
     // Sun light
     private sunLight: THREE.DirectionalLight | null = null;
 
@@ -310,12 +343,15 @@ class ThreeRenderer implements GameRenderer {
     private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
     // Camera orbit controlled by mouse
     private cameraYaw = 0;               // horizontal orbit angle (radians)
-    private cameraPitch = 0.35;          // vertical angle (radians, 0 = horizontal)
-    private cameraDistance = 1;          // distance from player
+    private cameraPitch = 0.4;           // vertical angle (radians, 0 = horizontal)
+    private cameraDistance = 1.8;        // distance from player
     private mouseMoveHandler: ((e: MouseEvent) => void) | null = null;
     private pointerLockHandler: (() => void) | null = null;
     private static readonly PLAYER_SPEED = 2; // game units per second
     private static readonly MOUSE_SENSITIVITY = 0.001;
+    // Smoothed camera follow target — prevents bobbing & shift on direction changes
+    private cameraFollowTarget = new THREE.Vector3();
+    private cameraFollowInit = false;
 
     init(container: HTMLElement): void {
         this.container = container;
@@ -429,6 +465,11 @@ class ThreeRenderer implements GameRenderer {
             this.groundHeightApplied = true;
         }
 
+        // --- Stream grass chunks around camera ---
+        if (this.groundHeightApplied && scene.soilGrid && scene.heightMap) {
+            this.updateGrassChunks(scene);
+        }
+
         // --- Update ground texture when overlay changes ---
         const overlay = soilOverlay ?? null;
         if (overlay !== this.currentOverlay || !this.groundTextureApplied) {
@@ -443,6 +484,7 @@ class ThreeRenderer implements GameRenderer {
 
         // --- Sync entities ---
         this.syncPlants(scene);
+        this.syncFruits(scene);
         this.syncNPCs(scene, elapsed, highlight);
         this.syncBuildings(scene);
         this.syncResources(scene);
@@ -526,14 +568,15 @@ class ThreeRenderer implements GameRenderer {
             // Update game-space position
             this.playerPos.x += (moveX / SCALE) * speed * dt;
             this.playerPos.y += (moveZ / SCALE) * speed * dt;
-
-            // Character faces movement direction (smooth lerp)
-            const targetAngle = Math.atan2(moveX, moveZ);
-            let diff = targetAngle - this.playerAngle;
-            if (diff > Math.PI) diff -= Math.PI * 2;
-            if (diff < -Math.PI) diff += Math.PI * 2;
-            this.playerAngle += diff * 0.15;
         }
+
+        // --- Character always faces camera direction (smooth) ---
+        const targetAngle = this.cameraYaw;
+        let diff = targetAngle - this.playerAngle;
+        if (diff > Math.PI) diff -= Math.PI * 2;
+        if (diff < -Math.PI) diff += Math.PI * 2;
+        const rotLerp = 1 - Math.pow(0.00001, dt); // very fast, frame-rate independent
+        this.playerAngle += diff * rotLerp;
 
         // --- Position on terrain ---
         const pos = toWorld(this.playerPos);
@@ -543,18 +586,38 @@ class ThreeRenderer implements GameRenderer {
         // Walk animation
         animateWalk(this.playerMesh, elapsed, moving);
 
-        // --- Camera orbits player via mouse yaw/pitch ---
+        // --- Smooth camera follow target ---
+        // Separate lerp rates: XZ fast, Y very slow (prevents terrain bobbing)
+        const headY = pos.y + 0.4;
+        if (!this.cameraFollowInit) {
+            this.cameraFollowTarget.set(pos.x, headY, pos.z);
+            this.cameraFollowInit = true;
+        } else {
+            const lerpXZ = 1 - Math.pow(0.001, dt); // fast XZ follow (~0.93 at 60fps)
+            const lerpY = 1 - Math.pow(0.05, dt);  // slow Y follow (~0.25 at 60fps) — kills bobbing
+            this.cameraFollowTarget.x += (pos.x - this.cameraFollowTarget.x) * lerpXZ;
+            this.cameraFollowTarget.z += (pos.z - this.cameraFollowTarget.z) * lerpXZ;
+            this.cameraFollowTarget.y += (headY - this.cameraFollowTarget.y) * lerpY;
+        }
+
+        const pivot = this.cameraFollowTarget;
+
+        // --- Camera orbits smoothed pivot via mouse yaw/pitch ---
         const dist = this.cameraDistance;
-        const camX = pos.x - Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * dist;
-        const camY = pos.y + Math.sin(this.cameraPitch) * dist + 0.5;
-        const camZ = pos.z - Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * dist;
+        const cosPitch = Math.cos(this.cameraPitch);
+        const sinPitch = Math.sin(this.cameraPitch);
+        const targetCamX = pivot.x - Math.sin(this.cameraYaw) * cosPitch * dist;
+        const targetCamY = pivot.y + sinPitch * dist;
+        const targetCamZ = pivot.z - Math.cos(this.cameraYaw) * cosPitch * dist;
 
-        const targetCamPos = new THREE.Vector3(camX, camY, camZ);
-        this.threeCamera.position.lerp(targetCamPos, 0.15);
+        // Smooth camera position (frame-rate independent)
+        const camLerp = 1 - Math.pow(0.0001, dt); // very responsive (~0.97 at 60fps)
+        this.threeCamera.position.x += (targetCamX - this.threeCamera.position.x) * camLerp;
+        this.threeCamera.position.y += (targetCamY - this.threeCamera.position.y) * camLerp;
+        this.threeCamera.position.z += (targetCamZ - this.threeCamera.position.z) * camLerp;
 
-        // Look at player
-        const lookTarget = new THREE.Vector3(pos.x, pos.y + 0.4, pos.z);
-        this.threeCamera.lookAt(lookTarget);
+        // Look at smoothed pivot (not raw player pos)
+        this.threeCamera.lookAt(pivot);
     }
 
     destroy(): void {
@@ -582,7 +645,26 @@ class ThreeRenderer implements GameRenderer {
         this.corpseMeshes.forEach((m) => this.disposeObject(m));
         this.zoneMeshes.forEach((m) => this.disposeObject(m));
         this.stockLabels.forEach((m) => this.disposeObject(m));
-        this.plantMeshes.forEach((m) => this.disposeObject(m));
+        // Dispose instanced plant meshes
+        for (const inst of this.plantInstances.values()) {
+            this.threeScene?.remove(inst);
+            inst.dispose();
+        }
+        this.plantInstances.clear();
+        // Dispose cached plant part geometries & materials
+        for (const parts of this.plantPartCache.values()) {
+            for (const p of parts) { p.geo.dispose(); p.mat.dispose(); }
+        }
+        this.plantPartCache.clear();
+        // Dispose instanced fruit meshes
+        for (const inst of this.fruitInstances.values()) {
+            this.threeScene?.remove(inst);
+            inst.dispose();
+        }
+        this.fruitInstances.clear();
+        if (this.fruitGeo) { this.fruitGeo.dispose(); this.fruitGeo = null; }
+        for (const mat of this.fruitMatCache.values()) mat.dispose();
+        this.fruitMatCache.clear();
 
         this.npcMeshes.clear();
         this.buildingMeshes.clear();
@@ -590,7 +672,17 @@ class ThreeRenderer implements GameRenderer {
         this.corpseMeshes.clear();
         this.zoneMeshes.clear();
         this.stockLabels.clear();
-        this.plantMeshes.clear();
+
+        // Dispose grass chunks
+        for (const chunk of this.grassChunks.values()) {
+            this.threeScene?.remove(chunk.instA);
+            this.threeScene?.remove(chunk.instB);
+            chunk.instA.dispose();
+            chunk.instB.dispose();
+        }
+        this.grassChunks.clear();
+        if (this.grassPlaneGeo) { this.grassPlaneGeo.dispose(); this.grassPlaneGeo = null; }
+        if (this.grassMat) { this.grassMat.dispose(); this.grassMat = null; }
 
         // Dispose water mesh
         if (this.waterMesh) this.disposeObject(this.waterMesh);
@@ -638,51 +730,433 @@ class ThreeRenderer implements GameRenderer {
     }
 
     // =============================================================
+    //  GRASS CHUNK SYSTEM — streams instanced grass around camera
+    // =============================================================
+
+    private ensureGrassMaterial() {
+        if (this.grassMat) return;
+        const loader = new THREE.TextureLoader();
+        const grassTex = loader.load('/textures/grass.png');
+        grassTex.magFilter = THREE.LinearFilter;
+        grassTex.minFilter = THREE.LinearMipmapLinearFilter;
+        this.grassMat = new THREE.MeshLambertMaterial({
+            map: grassTex,
+            transparent: true,
+            alphaTest: 0.3,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+        });
+        this.grassPlaneGeo = new THREE.PlaneGeometry(0.8, 0.8);
+        this.grassPlaneGeo.translate(0, 0.4, 0);
+    }
+
+    /** Build a single grass chunk at chunk grid coords (cx, cz) */
+    private buildGrassChunk(
+        cx: number, cz: number,
+        soilGrid: SoilGrid, heightMap: HeightMap,
+        camWX: number, camWZ: number,
+    ): { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh } | null {
+        const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
+        const STEP = ThreeRenderer.GRASS_STEP;
+        const RADIUS = ThreeRenderer.GRASS_RENDER_RADIUS;
+        const FADE = ThreeRenderer.GRASS_FADE_START;
+
+        const worldX0 = cx * CS;
+        const worldZ0 = cz * CS;
+
+        // Deterministic seed per chunk for consistent randomness
+        const seed = (cx * 73856093) ^ (cz * 19349663);
+        let rng = (seed & 0x7fffffff) || 1;
+        const rand = () => { rng = (rng * 16807) % 2147483647; return (rng & 0x7fffffff) / 0x7fffffff; };
+
+        type GrassEntry = { x: number; y: number; z: number; scale: number; rot: number };
+        const entries: GrassEntry[] = [];
+
+        for (let lx = 0; lx < CS; lx += STEP) {
+            for (let lz = 0; lz < CS; lz += STEP) {
+                const wx = worldX0 + lx + (rand() - 0.5) * STEP * 1.4;
+                const wz = worldZ0 + lz + (rand() - 0.5) * STEP * 1.4;
+
+                // Soil check
+                const col = Math.floor((wx - soilGrid.originX) / soilGrid.cellSize);
+                const row = Math.floor((wz - soilGrid.originY) / soilGrid.cellSize);
+                if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
+                const idx = row * soilGrid.cols + col;
+                const hum = soilGrid.layers.humidity[idx];
+                const waterLvl = soilGrid.waterLevel[idx];
+                if (waterLvl > 0.1) continue;
+                if (hum < 0.10) continue; // absolute minimum
+
+                // Smooth humidity gradient: density + size taper off gradually
+                const humFactor = Math.min(1, Math.max(0, (hum - 0.10) / 0.40)); // 0→1 over hum 0.10..0.50
+                // Probabilistic density: less humid = fewer patches
+                if (rand() > humFactor * humFactor) continue; // squared for sharper falloff in dry areas
+
+                // Distance fade: shrink grass near edge of render radius
+                const distToCam = Math.sqrt((wx - camWX) ** 2 + (wz - camWZ) ** 2);
+                if (distToCam > RADIUS) continue;
+                const fadeRatio = distToCam / RADIUS;
+                const distFade = fadeRatio > FADE ? 1 - (fadeRatio - FADE) / (1 - FADE) : 1;
+
+                const h = getHeightAt(heightMap, wx, wz) * HEIGHT_SCALE;
+                // Size also scales with humidity — sparse thin grass in dry, lush in wet
+                const humScale = 0.5 + humFactor * 0.5; // 50%–100% size
+                const baseScale = (0.15 + rand() * 0.15) * humScale;
+                const scale = baseScale * distFade;
+                if (scale < 0.02) continue; // too small, skip
+                const rot = rand() * Math.PI;
+
+                entries.push({ x: wx * SCALE, y: h, z: wz * SCALE, scale, rot });
+            }
+        }
+
+        if (entries.length === 0) return null;
+
+        this.ensureGrassMaterial();
+        const count = entries.length;
+
+        const instA = new THREE.InstancedMesh(this.grassPlaneGeo!, this.grassMat!, count);
+        const instB = new THREE.InstancedMesh(this.grassPlaneGeo!, this.grassMat!, count);
+        instA.frustumCulled = false;
+        instB.frustumCulled = false;
+
+        const rA = new THREE.Quaternion();
+        const rB = new THREE.Quaternion();
+        const yAxis = new THREE.Vector3(0, 1, 0);
+
+        for (let i = 0; i < count; i++) {
+            const e = entries[i];
+            rA.setFromAxisAngle(yAxis, e.rot);
+            _pos3.set(e.x, e.y, e.z);
+            _scl3.set(e.scale, e.scale, e.scale);
+            _mat4.compose(_pos3, rA, _scl3);
+            instA.setMatrixAt(i, _mat4);
+
+            rB.setFromAxisAngle(yAxis, e.rot + Math.PI * 0.5);
+            _mat4.compose(_pos3, rB, _scl3);
+            instB.setMatrixAt(i, _mat4);
+        }
+
+        instA.instanceMatrix.needsUpdate = true;
+        instB.instanceMatrix.needsUpdate = true;
+        return { instA, instB };
+    }
+
+    /** Called each frame — add/remove grass chunks around camera */
+    private updateGrassChunks(scene: Scene) {
+        const soilGrid = scene.soilGrid!;
+        const heightMap = scene.heightMap!;
+
+        // Camera world position
+        let camWX: number, camWZ: number;
+        if (this.thirdPerson) {
+            camWX = this.playerPos.x;
+            camWZ = this.playerPos.y;
+        } else {
+            camWX = this.threeCamera!.position.x / SCALE;
+            camWZ = this.threeCamera!.position.z / SCALE;
+        }
+
+        // Only rebuild when camera moved significantly (half a chunk)
+        const dx = camWX - this.grassLastCamX;
+        const dz = camWZ - this.grassLastCamZ;
+        if (dx * dx + dz * dz < (ThreeRenderer.GRASS_CHUNK_SIZE * 0.5) ** 2) return;
+        this.grassLastCamX = camWX;
+        this.grassLastCamZ = camWZ;
+
+        const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
+        const RADIUS = ThreeRenderer.GRASS_RENDER_RADIUS;
+
+        // Determine which chunks should be visible
+        const chunkRadius = Math.ceil(RADIUS / CS);
+        const camCX = Math.floor(camWX / CS);
+        const camCZ = Math.floor(camWZ / CS);
+        const neededKeys = new Set<string>();
+
+        for (let dcx = -chunkRadius; dcx <= chunkRadius; dcx++) {
+            for (let dcz = -chunkRadius; dcz <= chunkRadius; dcz++) {
+                const cx = camCX + dcx;
+                const cz = camCZ + dcz;
+                // Check chunk center distance
+                const chunkCenterX = (cx + 0.5) * CS;
+                const chunkCenterZ = (cz + 0.5) * CS;
+                const dist = Math.sqrt((chunkCenterX - camWX) ** 2 + (chunkCenterZ - camWZ) ** 2);
+                if (dist > RADIUS + CS) continue;
+                neededKeys.add(`${cx},${cz}`);
+            }
+        }
+
+        // Remove chunks no longer needed
+        for (const [key, chunk] of this.grassChunks) {
+            if (!neededKeys.has(key)) {
+                this.threeScene!.remove(chunk.instA);
+                this.threeScene!.remove(chunk.instB);
+                chunk.instA.dispose();
+                chunk.instB.dispose();
+                this.grassChunks.delete(key);
+            }
+        }
+
+        // Create missing chunks
+        for (const key of neededKeys) {
+            if (this.grassChunks.has(key)) continue;
+            const [cx, cz] = key.split(',').map(Number);
+            const chunk = this.buildGrassChunk(cx, cz, soilGrid, heightMap, camWX, camWZ);
+            if (chunk) {
+                this.threeScene!.add(chunk.instA);
+                this.threeScene!.add(chunk.instB);
+                this.grassChunks.set(key, chunk);
+            }
+        }
+    }
+
+    // =============================================================
     //  SYNC METHODS
+    // =============================================================
+
+    // =============================================================
+    //  PLANT PART TEMPLATES (cached geometry + material per species+stage)
+    // =============================================================
+
+    private getPlantParts(speciesId: string, stage: string, maxSize: number, color: string, matureColor: string): PlantPartDef[] {
+        const key = `${speciesId}-${stage}`;
+        let parts = this.plantPartCache.get(key);
+        if (parts) return parts;
+
+        parts = [];
+        const sz = maxSize * SCALE;
+        // growing/mature → mature color, others → base color
+        const useMature = stage === 'mature' || stage === 'growing';
+        const c = new THREE.Color(useMature ? matureColor : color);
+
+        if (stage === 'seed') {
+            parts.push({
+                geo: new THREE.SphereGeometry(0.03, 6, 6),
+                mat: new THREE.MeshLambertMaterial({ color: 0x8B7355 }),
+                offsetY: 0.02,
+            });
+        } else if (stage === 'dead') {
+            // Simplified dead stump
+            parts.push({
+                geo: new THREE.CylinderGeometry(sz * 0.05, sz * 0.07, sz * 0.3, 5),
+                mat: new THREE.MeshLambertMaterial({ color: 0x6B5B3A }),
+                offsetY: sz * 0.15,
+            });
+        } else if (speciesId === 'oak' || speciesId === 'pine') {
+            const trunkH = sz * 0.8;
+            const trunkR = sz * 0.08;
+            parts.push({
+                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6),
+                mat: new THREE.MeshLambertMaterial({ color: 0x6B4226 }),
+                offsetY: trunkH / 2,
+            });
+            if (speciesId === 'pine') {
+                const crownH = sz * 1.2;
+                const crownR = sz * 0.45;
+                parts.push({
+                    geo: new THREE.ConeGeometry(crownR, crownH, 8),
+                    mat: new THREE.MeshLambertMaterial({ color: c }),
+                    offsetY: trunkH + crownH * 0.35,
+                });
+            } else {
+                const crownR = sz * 0.55;
+                parts.push({
+                    geo: new THREE.SphereGeometry(crownR, 8, 6),
+                    mat: new THREE.MeshLambertMaterial({ color: c }),
+                    offsetY: trunkH + crownR * 0.3,
+                });
+            }
+        } else if (speciesId === 'raspberry') {
+            const bushR = sz * 0.4;
+            const bushGeo = new THREE.SphereGeometry(bushR, 8, 6);
+            bushGeo.scale(1, 0.6, 1);
+            parts.push({
+                geo: bushGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: sz * 0.3,
+            });
+        } else if (speciesId === 'wheat') {
+            const stalkH = sz * 0.7;
+            parts.push({
+                geo: new THREE.CylinderGeometry(0.01, 0.015, stalkH, 4),
+                mat: new THREE.MeshLambertMaterial({ color: 0x8B8B3A }),
+                offsetY: stalkH / 2,
+            });
+            const headGeo = new THREE.SphereGeometry(sz * 0.12, 6, 4);
+            headGeo.scale(0.6, 1.2, 0.6);
+            parts.push({
+                geo: headGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: stalkH,
+            });
+        } else {
+            // Wildflower / default
+            const stemH = sz * 0.4;
+            parts.push({
+                geo: new THREE.CylinderGeometry(0.01, 0.015, stemH, 4),
+                mat: new THREE.MeshLambertMaterial({ color: 0x4a7a4a }),
+                offsetY: stemH / 2,
+            });
+            parts.push({
+                geo: new THREE.SphereGeometry(sz * 0.2, 8, 6),
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: stemH + sz * 0.1,
+            });
+        }
+
+        this.plantPartCache.set(key, parts);
+        return parts;
+    }
+
+    // =============================================================
+    //  INSTANCED PLANT SYNC
     // =============================================================
 
     private syncPlants(scene: Scene) {
         const plants = scene.entities.filter((e): e is PlantEntity => e.type === 'plant');
-        const activeIds = new Set(plants.map((p) => p.id));
 
-        // Remove gone plants
-        for (const [id, mesh] of this.plantMeshes) {
-            if (!activeIds.has(id)) {
-                this.threeScene!.remove(mesh);
-                this.disposeObject(mesh);
-                this.plantMeshes.delete(id);
+        // Group plants by speciesId-stage
+        const groups = new Map<string, PlantEntity[]>();
+        for (const plant of plants) {
+            if (!getSpecies(plant.speciesId)) continue;
+            const key = `${plant.speciesId}-${plant.stage}`;
+            let arr = groups.get(key);
+            if (!arr) { arr = []; groups.set(key, arr); }
+            arr.push(plant);
+        }
+
+        const activeKeys = new Set<string>();
+
+        for (const [groupKey, groupPlants] of groups) {
+            const species = getSpecies(groupPlants[0].speciesId)!;
+            const stage = groupPlants[0].stage;
+            const parts = this.getPlantParts(species.id, stage, species.maxSize, species.color, species.matureColor);
+            const count = groupPlants.length;
+
+            for (let pi = 0; pi < parts.length; pi++) {
+                const iKey = `${groupKey}-${pi}`;
+                activeKeys.add(iKey);
+
+                let inst = this.plantInstances.get(iKey);
+                const capacity = inst ? (inst as unknown as { _cap: number })._cap ?? 0 : 0;
+
+                // Allocate or grow InstancedMesh when needed
+                if (!inst || capacity < count) {
+                    if (inst) {
+                        this.threeScene!.remove(inst);
+                        inst.dispose();
+                    }
+                    const newCap = Math.max(count * 2, 32);
+                    inst = new THREE.InstancedMesh(parts[pi].geo, parts[pi].mat, newCap);
+                    inst.frustumCulled = false;
+                    (inst as unknown as { _cap: number })._cap = newCap;
+                    this.threeScene!.add(inst);
+                    this.plantInstances.set(iKey, inst);
+                }
+
+                inst.count = count;
+                const offsetY = parts[pi].offsetY;
+
+                for (let i = 0; i < count; i++) {
+                    const plant = groupPlants[i];
+                    const s = Math.max(0.15, plant.growth) * 0.5;
+                    const pos = toWorld(plant.position);
+                    _pos3.set(pos.x, pos.y + offsetY * s, pos.z);
+                    _scl3.set(s, s, s);
+                    _mat4.compose(_pos3, _quat, _scl3);
+                    inst.setMatrixAt(i, _mat4);
+                }
+                inst.instanceMatrix.needsUpdate = true;
             }
         }
 
-        for (const plant of plants) {
-            const species = getSpecies(plant.speciesId);
-            if (!species) continue;
+        // Remove stale instanced meshes
+        for (const [key, mesh] of this.plantInstances) {
+            if (!activeKeys.has(key)) {
+                this.threeScene!.remove(mesh);
+                mesh.dispose();
+                this.plantInstances.delete(key);
+            }
+        }
+    }
 
-            let group = this.plantMeshes.get(plant.id);
-            const stageTag = (group as unknown as { _stage?: string })?._stage;
+    // =============================================================
+    //  INSTANCED FRUIT SYNC
+    // =============================================================
 
-            // Recreate mesh when stage changes (seed→sprout→growing→mature→dead)
-            if (group && stageTag !== plant.stage) {
-                this.threeScene!.remove(group);
-                this.disposeObject(group);
-                group = undefined;
-                this.plantMeshes.delete(plant.id);
+    private syncFruits(scene: Scene) {
+        const fruits = scene.entities.filter((e): e is FruitEntity => e.type === 'fruit');
+
+        if (!this.fruitGeo) {
+            this.fruitGeo = new THREE.SphereGeometry(0.06, 6, 4);
+        }
+
+        // Group by speciesId (same color base)
+        const groups = new Map<string, FruitEntity[]>();
+        for (const fruit of fruits) {
+            let arr = groups.get(fruit.speciesId);
+            if (!arr) { arr = []; groups.set(fruit.speciesId, arr); }
+            arr.push(fruit);
+        }
+
+        const activeKeys = new Set<string>();
+
+        for (const [speciesId, group] of groups) {
+            activeKeys.add(speciesId);
+            const count = group.length;
+
+            // Get or create material for this species
+            if (!this.fruitMatCache.has(speciesId)) {
+                this.fruitMatCache.set(speciesId, new THREE.MeshLambertMaterial({
+                    color: 0xffffff, // white base — actual color set per-instance via setColorAt
+                }));
+            }
+            const mat = this.fruitMatCache.get(speciesId)!;
+
+            let inst = this.fruitInstances.get(speciesId);
+            const capacity = inst ? (inst as unknown as { _cap: number })._cap ?? 0 : 0;
+
+            if (!inst || capacity < count) {
+                if (inst) {
+                    this.threeScene!.remove(inst);
+                    inst.dispose();
+                }
+                const newCap = Math.max(count * 2, 64);
+                inst = new THREE.InstancedMesh(this.fruitGeo, mat, newCap);
+                inst.frustumCulled = false;
+                (inst as unknown as { _cap: number })._cap = newCap;
+                this.threeScene!.add(inst);
+                this.fruitInstances.set(speciesId, inst);
             }
 
-            if (!group) {
-                group = createPlantMesh(plant, species.id, species.color, species.matureColor, species.maxSize);
-                (group as unknown as { _stage: string })._stage = plant.stage;
-                this.threeScene!.add(group);
-                this.plantMeshes.set(plant.id, group);
+            inst.count = count;
+            const baseColor = new THREE.Color(group[0].color);
+
+            for (let i = 0; i < count; i++) {
+                const fruit = group[i];
+                const pos = toWorld(fruit.position);
+                _pos3.set(pos.x, pos.y + 0.03, pos.z);
+                _scl3.set(1, 1, 1);
+                _mat4.compose(_pos3, _quat, _scl3);
+                inst.setMatrixAt(i, _mat4);
+
+                // Darken color as fruit rots (last 30% of life)
+                const lifeRatio = 1 - fruit.age / fruit.maxAge;
+                const brightness = lifeRatio < 0.3 ? lifeRatio / 0.3 : 1;
+                _col3.copy(baseColor).multiplyScalar(brightness);
+                inst.setColorAt(i, _col3);
             }
+            inst.instanceMatrix.needsUpdate = true;
+            if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+        }
 
-            // Update position (Y from heightmap)
-            const pos = toWorld(plant.position);
-            group.position.set(pos.x, pos.y, pos.z);
-
-            // Update scale based on growth (within a stage)
-            const s = Math.max(0.15, plant.growth) * 0.5;
-            group.scale.setScalar(s);
+        // Remove stale
+        for (const [key, mesh] of this.fruitInstances) {
+            if (!activeKeys.has(key)) {
+                this.threeScene!.remove(mesh);
+                mesh.dispose();
+                this.fruitInstances.delete(key);
+            }
         }
     }
 
@@ -1088,12 +1562,12 @@ class ThreeRenderer implements GameRenderer {
                     const earthFactor = minerals * 0.6;
 
                     // Base grass color (golden tan)
-                    let br = 165, bg = 155, bb = 100;
+                    let br = 145, bg = 140, bb = 90;
 
-                    // Blend towards green (humid)
-                    br += Math.round((-120) * greenFactor);  // 165 → 45
-                    bg += Math.round((30) * greenFactor);     // 155 → 185
-                    bb += Math.round((-60) * greenFactor);    // 100 → 40
+                    // Blend towards dark green (humid) — darker to match grass texture
+                    br += Math.round((-110) * greenFactor);  // 145 → 35
+                    bg += Math.round((0) * greenFactor);      // 140 → 140
+                    bb += Math.round((-60) * greenFactor);    // 90 → 30
 
                     // Blend towards brown earth (minerals)
                     br += Math.round(15 * earthFactor);
@@ -1350,95 +1824,6 @@ function drawTextToCanvas(ctx: CanvasRenderingContext2D, text: string, color: st
     // Text
     ctx.fillStyle = color;
     ctx.fillText(text, w / 2, h / 2);
-}
-
-// =============================================================
-//  PLANT MESHES
-// =============================================================
-
-function createPlantMesh(
-    plant: PlantEntity,
-    speciesId: string,
-    color: string,
-    matureColor: string,
-    maxSize: number,
-): THREE.Group {
-    const group = new THREE.Group();
-    const c = plant.growth > 0.6 ? new THREE.Color(matureColor) : new THREE.Color(color);
-    const sz = maxSize * SCALE;
-
-    if (plant.stage === 'seed') {
-        // Tiny brown sphere
-        const geo = new THREE.SphereGeometry(0.03, 6, 6);
-        const mat = new THREE.MeshLambertMaterial({ color: 0x8B7355 });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.position.y = 0.02;
-        group.add(mesh);
-        return group;
-    }
-
-    if (speciesId === 'oak' || speciesId === 'pine') {
-        // Trunk
-        const trunkH = sz * 0.8;
-        const trunkR = sz * 0.08;
-        const trunkGeo = new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6);
-        const trunkMat = new THREE.MeshLambertMaterial({ color: 0x6B4226 });
-        const trunk = new THREE.Mesh(trunkGeo, trunkMat);
-        trunk.position.y = trunkH / 2;
-        group.add(trunk);
-
-        // Crown
-        if (speciesId === 'pine') {
-            // Cone
-            const crownH = sz * 1.2;
-            const crownR = sz * 0.45;
-            const crownGeo = new THREE.ConeGeometry(crownR, crownH, 8);
-            const crownMat = new THREE.MeshLambertMaterial({ color: c });
-            const crown = new THREE.Mesh(crownGeo, crownMat);
-            crown.position.y = trunkH + crownH * 0.35;
-            group.add(crown);
-        } else {
-            // Sphere
-            const crownR = sz * 0.55;
-            const crownGeo = new THREE.SphereGeometry(crownR, 8, 6);
-            const crownMat = new THREE.MeshLambertMaterial({ color: c });
-            const crown = new THREE.Mesh(crownGeo, crownMat);
-            crown.position.y = trunkH + crownR * 0.3;
-            group.add(crown);
-        }
-    } else if (speciesId === 'wheat') {
-        // Stalk
-        const stalkH = sz * 0.7;
-        const stalkGeo = new THREE.CylinderGeometry(0.01, 0.015, stalkH, 4);
-        const stalkMat = new THREE.MeshLambertMaterial({ color: 0x8B8B3A });
-        const stalk = new THREE.Mesh(stalkGeo, stalkMat);
-        stalk.position.y = stalkH / 2;
-        group.add(stalk);
-
-        // Grain head
-        const headGeo = new THREE.SphereGeometry(sz * 0.12, 6, 4);
-        headGeo.scale(0.6, 1.2, 0.6);
-        const headMat = new THREE.MeshLambertMaterial({ color: c });
-        const head = new THREE.Mesh(headGeo, headMat);
-        head.position.y = stalkH;
-        group.add(head);
-    } else {
-        // Default: wildflower — stem + sphere
-        const stemH = sz * 0.4;
-        const stemGeo = new THREE.CylinderGeometry(0.01, 0.015, stemH, 4);
-        const stemMat = new THREE.MeshLambertMaterial({ color: 0x4a7a4a });
-        const stem = new THREE.Mesh(stemGeo, stemMat);
-        stem.position.y = stemH / 2;
-        group.add(stem);
-
-        const petalGeo = new THREE.SphereGeometry(sz * 0.2, 8, 6);
-        const petalMat = new THREE.MeshLambertMaterial({ color: c });
-        const petal = new THREE.Mesh(petalGeo, petalMat);
-        petal.position.y = stemH + sz * 0.1;
-        group.add(petal);
-    }
-
-    return group;
 }
 
 // --- Register ---

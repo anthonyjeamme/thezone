@@ -3,7 +3,7 @@
 // =============================================================
 
 import { computePlantFertility, getSoilAt, setSoilPropertyAt, SOIL_PROPERTIES, type PlantSoilNeeds, type SoilGrid } from './fertility';
-import { SECONDS_PER_DAY, type PlantEntity, type PlantGrowthStage, type Scene } from './types';
+import { SECONDS_PER_DAY, type FruitEntity, type PlantEntity, type PlantGrowthStage, type Scene } from './types';
 import { generateEntityId } from '../Shared/ids';
 
 // =============================================================
@@ -43,6 +43,25 @@ export type PlantSpecies = {
         intervalDays: number;
         /** Max distance seeds can land from parent (px) */
         radius: number;
+    };
+    /** Fruit production (optional — not all plants produce fruits) */
+    fruitProduction?: {
+        /** Display name of the fruit (e.g. "Gland", "Grain") */
+        fruitName: string;
+        /** Color for rendering */
+        fruitColor: string;
+        /** Nutrition value when consumed (0..1) */
+        nutritionValue: number;
+        /** Min plant growth to start producing (0..1) */
+        minGrowth: number;
+        /** How many fruits per production event */
+        fruitsPerCycle: number;
+        /** Days between fruit production events */
+        intervalDays: number;
+        /** Radius (px) around the plant where fruits drop */
+        dropRadius: number;
+        /** Days before a dropped fruit rots and disappears */
+        lifetimeDays: number;
     };
 };
 
@@ -88,6 +107,16 @@ registerSpecies({
         intervalDays: 5,       // tous les 5 jours
         radius: 120,           // tombent pas loin (gravité)
     },
+    fruitProduction: {
+        fruitName: 'Gland',
+        fruitColor: '#8B6914',
+        nutritionValue: 0.15,  // pas très nutritif seul
+        minGrowth: 0.9,        // doit être bien mature
+        fruitsPerCycle: 4,
+        intervalDays: 4,
+        dropRadius: 60,        // tombent autour du tronc
+        lifetimeDays: 8,       // pourrissent lentement
+    },
 });
 
 registerSpecies({
@@ -108,6 +137,16 @@ registerSpecies({
         seedCount: 5,          // beaucoup de grains
         intervalDays: 3,
         radius: 40,            // tombe au pied
+    },
+    fruitProduction: {
+        fruitName: 'Grain',
+        fruitColor: '#D4A017',
+        nutritionValue: 0.3,   // bon aliment de base
+        minGrowth: 0.75,
+        fruitsPerCycle: 6,
+        intervalDays: 2,       // production rapide
+        dropRadius: 15,        // tombe au pied
+        lifetimeDays: 5,       // pourrit assez vite
     },
 });
 
@@ -132,6 +171,38 @@ registerSpecies({
 });
 
 registerSpecies({
+    id: 'raspberry',
+    displayName: 'Framboisier',
+    soilNeeds: {
+        humidity: { ideal: 0.55, tolerance: 0.30, weight: 1.0 },
+        minerals: { ideal: 0.45, tolerance: 0.35, weight: 0.5 },
+        organicMatter: { ideal: 0.55, tolerance: 0.35, weight: 0.7 },
+        sunExposure: { ideal: 0.60, tolerance: 0.30, weight: 0.7 },
+    },
+    color: '#5a8a4a',
+    matureColor: '#3d6b2e',
+    maxSize: 7,
+    growthDays: 6,             // pousse assez vite
+    resilience: 0.55,
+    seedSpread: {
+        minGrowth: 0.7,
+        seedCount: 3,
+        intervalDays: 4,
+        radius: 60,            // oiseaux dispersent les graines
+    },
+    fruitProduction: {
+        fruitName: 'Framboise',
+        fruitColor: '#C2185B',
+        nutritionValue: 0.25,  // bon petit fruit
+        minGrowth: 0.75,
+        fruitsPerCycle: 5,     // production généreuse
+        intervalDays: 2,       // cycle rapide
+        dropRadius: 20,        // tombe au pied du buisson
+        lifetimeDays: 3,       // fruit fragile, pourrit vite
+    },
+});
+
+registerSpecies({
     id: 'pine',
     displayName: 'Pin',
     soilNeeds: {
@@ -149,6 +220,16 @@ registerSpecies({
         seedCount: 4,          // pommes de pin
         intervalDays: 6,
         radius: 100,
+    },
+    fruitProduction: {
+        fruitName: 'Pomme de pin',
+        fruitColor: '#5C4033',
+        nutritionValue: 0.1,   // pas très nutritif (pignons)
+        minGrowth: 0.9,
+        fruitsPerCycle: 3,
+        intervalDays: 5,
+        dropRadius: 50,
+        lifetimeDays: 12,      // résistant, sèche lentement
     },
 });
 
@@ -344,9 +425,103 @@ function tryDisperse(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt
             age: 0,
             stage: 'seed',
             seedTimer: 0,
+            fruitTimer: 0,
         };
 
         scene.entities.push(seed);
+    }
+}
+
+// =============================================================
+//  FRUIT PRODUCTION
+// =============================================================
+
+/**
+ * Try to produce fruits from a mature plant.
+ * Fruits are dropped as FruitEntity around the plant.
+ */
+function tryProduceFruits(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt: number) {
+    const fp = species.fruitProduction;
+    if (!fp) return; // this species doesn't produce fruits
+
+    // Not mature enough
+    if (plant.growth < fp.minGrowth) return;
+    // Must be healthy
+    if (plant.health < 40) return;
+
+    plant.fruitTimer -= dt;
+    if (plant.fruitTimer > 0) return;
+
+    // Reset timer
+    plant.fruitTimer = DAYS(fp.intervalDays);
+
+    // Health factor: healthier plants produce more fruits
+    const healthFactor = Math.min(1, plant.health / 80);
+    const count = Math.max(1, Math.round(fp.fruitsPerCycle * healthFactor));
+
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.sqrt(Math.random()) * fp.dropRadius;
+
+        const fruitPos = {
+            x: plant.position.x + Math.cos(angle) * dist,
+            y: plant.position.y + Math.sin(angle) * dist,
+        };
+
+        // Don't drop fruits into water
+        if (scene.lakesEnabled && scene.soilGrid) {
+            const idx = cellIndex(scene.soilGrid, fruitPos.x, fruitPos.y);
+            if (idx >= 0 && scene.soilGrid.waterLevel[idx] > 0.3) continue;
+        }
+
+        const fruit: FruitEntity = {
+            id: `fruit-${generateEntityId()}`,
+            type: 'fruit',
+            speciesId: species.id,
+            fruitName: fp.fruitName,
+            position: fruitPos,
+            nutritionValue: fp.nutritionValue,
+            age: 0,
+            maxAge: DAYS(fp.lifetimeDays),
+            color: fp.fruitColor,
+        };
+
+        scene.entities.push(fruit);
+    }
+}
+
+// =============================================================
+//  FRUIT AGING — fruits rot and decompose into soil
+// =============================================================
+
+/**
+ * Process all fruits in the scene: age them, and when they rot,
+ * return organic matter to the soil.
+ */
+function processFruits(scene: Scene, dt: number) {
+    const soilGrid = scene.soilGrid;
+
+    for (let i = scene.entities.length - 1; i >= 0; i--) {
+        const entity = scene.entities[i];
+        if (entity.type !== 'fruit') continue;
+
+        const fruit = entity as FruitEntity;
+        fruit.age += dt;
+
+        // Fruit rotted — remove and add organic matter to soil
+        if (fruit.age >= fruit.maxAge) {
+            if (soilGrid) {
+                const idx = cellIndex(soilGrid, fruit.position.x, fruit.position.y);
+                if (idx >= 0) {
+                    // Small amount of organic matter from decomposing fruit
+                    soilGrid.layers.organicMatter[idx] = Math.min(
+                        1,
+                        soilGrid.layers.organicMatter[idx] + 0.005 * fruit.nutritionValue,
+                    );
+                }
+            }
+            scene.entities.splice(i, 1);
+        }
     }
 }
 
@@ -514,6 +689,11 @@ export function processFlora(scene: Scene, dt: number) {
             tryDisperse(scene, plant, species, dt);
         }
 
+        // --- Fruit production ---
+        if (plant.health > 0) {
+            tryProduceFruits(scene, plant, species, dt);
+        }
+
         // --- Update stage ---
         const wasDead = plant.stage === 'dead';
         plant.stage = computeStage(plant.growth, plant.health);
@@ -537,4 +717,7 @@ export function processFlora(scene: Scene, dt: number) {
             }
         }
     }
+
+    // --- Process fruit aging / rotting ---
+    processFruits(scene, dt);
 }

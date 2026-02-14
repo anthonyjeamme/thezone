@@ -5,7 +5,7 @@ import classNameModule from '@anthonyjeamme/classname';
 import styles from './Game.module.scss';
 import { processWorld } from '../World/simulation';
 import { processAI } from '../AI/brain';
-import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_HOUR, Scene, getCalendar, getLifeStage } from '../World/types';
+import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_DAY, SECONDS_PER_HOUR, Scene, getCalendar, getLifeStage } from '../World/types';
 import { getItemDef } from '../Shared/registry';
 import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from '../World/terrain';
 import { generateEntityId } from '../Shared/ids';
@@ -285,20 +285,60 @@ function generateResourceCluster(
     }
 }
 
-function generateTestPlants(entities: Scene['entities']) {
-    // Single test plant at world center for development
-    const plant: PlantEntity = {
-        id: `plant-${generateEntityId()}`,
-        type: 'plant',
-        speciesId: 'oak',
-        position: { x: 0, y: 0 },
-        growth: 0,
-        health: 100,
-        age: 0,
-        stage: 'seed',
-        seedTimer: 0,
-    };
-    entities.push(plant);
+function generateTestPlants(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid) {
+    const WORLD_HALF = 1200;
+    const MARGIN = 100; // stay away from edges
+
+    // Species configs: id, count, preferred humidity range, growth range
+    const speciesSetup: { id: string; count: number; humRange: [number, number]; growthRange: [number, number] }[] = [
+        { id: 'oak',        count: 25, humRange: [0.35, 0.80], growthRange: [0.0, 1.0] },
+        { id: 'pine',       count: 20, humRange: [0.20, 0.60], growthRange: [0.0, 1.0] },
+        { id: 'wheat',      count: 30, humRange: [0.40, 0.75], growthRange: [0.0, 0.9] },
+        { id: 'wildflower', count: 20, humRange: [0.25, 0.70], growthRange: [0.0, 0.8] },
+        { id: 'raspberry',  count: 20, humRange: [0.40, 0.75], growthRange: [0.0, 1.0] },
+    ];
+
+    for (const setup of speciesSetup) {
+        let placed = 0;
+        let attempts = 0;
+        const maxAttempts = setup.count * 10;
+
+        while (placed < setup.count && attempts < maxAttempts) {
+            attempts++;
+            const x = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+            const y = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+
+            // Check soil humidity — prefer matching terrain
+            const col = Math.floor((x - soilGrid.originX) / soilGrid.cellSize);
+            const row = Math.floor((y - soilGrid.originY) / soilGrid.cellSize);
+            if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
+            const hum = soilGrid.layers.humidity[row * soilGrid.cols + col];
+            if (hum < setup.humRange[0] || hum > setup.humRange[1]) continue;
+
+            // Random initial growth — some already mature for immediate fruit production
+            const [gMin, gMax] = setup.growthRange;
+            const growth = gMin + Math.random() * (gMax - gMin);
+            const stage = growth < 0.02 ? 'seed' as const
+                : growth < 0.15 ? 'sprout' as const
+                : growth < 0.85 ? 'growing' as const
+                : 'mature' as const;
+
+            const plant: PlantEntity = {
+                id: `plant-${generateEntityId()}`,
+                type: 'plant',
+                speciesId: setup.id,
+                position: { x, y },
+                growth,
+                health: 100,
+                age: growth * SECONDS_PER_DAY * 5, // approximate age from growth
+                stage,
+                seedTimer: Math.random() * SECONDS_PER_DAY * 2,
+                fruitTimer: Math.random() * SECONDS_PER_DAY * 2,
+            };
+            entities.push(plant);
+            placed++;
+        }
+    }
 }
 
 function createInitialScene(): Scene {
@@ -330,8 +370,8 @@ function createInitialScene(): Scene {
     const basinMap = createBasinMap(heightMap);
     const depressionMap = createDepressionMap(heightMap);
 
-    // Scatter test plants
-    generateTestPlants(entities);
+    // Scatter initial plants across the map
+    generateTestPlants(entities, soilGrid);
 
     const weather = createWeatherState();
     const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true };

@@ -463,11 +463,26 @@ export type PlantEntity = {
     age: number;              // sim-seconds alive
     stage: PlantGrowthStage;
     seedTimer: number;        // sim-seconds until next seed dispersal
+    fruitTimer: number;       // sim-seconds until next fruit production
+};
+
+// --- Fruit Entity ---
+
+export type FruitEntity = {
+    id: string;
+    type: 'fruit';
+    speciesId: string;        // which plant species produced this fruit
+    fruitName: string;        // display name (e.g. "Gland", "Grain")
+    position: Vector2D;
+    nutritionValue: number;   // food value when consumed (0..1)
+    age: number;              // sim-seconds since dropped
+    maxAge: number;           // sim-seconds before rotting completely
+    color: string;            // rendering color
 };
 
 // --- Scene ---
 
-export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity | PlantEntity;
+export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity | PlantEntity | FruitEntity;
 
 export type Scene = {
     entities: SceneEntity[];
