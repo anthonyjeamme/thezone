@@ -1,13 +1,13 @@
-import { AGE_BABY, CABIN_WOOD_COST, KnownNPC, KnownZone, NPCEntity, ResourceType, SECONDS_PER_HOUR, Scene, StockEntity, WorldAPI, getLifeStage, getPartnerId, hasPartner, countItem, addItem, removeItem } from './Game.types';
-import { getJobDef, getRecipesForJob, hasAllItems } from './Game.registry';
-import type { RecipeDef } from './Game.registry';
-import { resolveAttack, shouldFlee, ATTACK_RANGE, ATTACK_COOLDOWN, AGGRO_RANGE } from './Game.combat';
-import { areFactionsHostile } from './Game.factions';
-import { distance } from './Game.vector';
-import { assessSelf, perceive } from './Game.perception';
-import { createWorldAPI } from './Game.world';
-import { DESIRE_THRESHOLD } from './Game.reproduction';
-import { logger } from './Game.logger';
+import { AGE_BABY, CABIN_WOOD_COST, KnownNPC, KnownZone, NPCEntity, NPCInfo, ResourceType, Scene, SECONDS_PER_HOUR, SharedZoneInfo, WorldAPI, getLifeStage, getPartnerId, hasPartner, countItem, logAction } from '../World/types';
+import { getJobDef, getRecipesForJob } from '../Shared/registry';
+
+import { ATTACK_RANGE, ATTACK_COOLDOWN, AGGRO_RANGE } from '../World/combat';
+import { areFactionsHostile } from '../World/factions';
+import { distance } from '../Shared/vector';
+import { assessSelf, perceiveNPC, perceiveStock, perceiveThreat } from './perception';
+import { createWorldAPI } from '../World/simulation';
+import { DESIRE_THRESHOLD } from '../World/reproduction';
+import { logger } from '../Shared/logger';
 
 // --- AI Constants ---
 
@@ -76,9 +76,20 @@ function getEffectiveExplorationRange(entity: NPCEntity): number {
     return range;
 }
 
+/**
+ * Flee check using biased threat perception.
+ * Uses perceiveThreat() from the perception layer — accounts for courage, intelligence, health.
+ */
+function shouldFleeFrom(self: NPCEntity, enemy: NPCInfo): boolean {
+    const threat = perceiveThreat(self, enemy);
+    return threat.shouldFlee;
+}
+
 // --- Main entry point ---
 
 export function processAI(scene: Scene, dt: number) {
+    // processAI is the system-level orchestrator — it bridges scene and AI.
+    // Everything below this function uses WorldAPI exclusively, never scene.entities.
     const npcs = scene.entities.filter(
         (e): e is NPCEntity => e.type === 'npc'
     );
@@ -97,19 +108,25 @@ export function processAI(scene: Scene, dt: number) {
         if (entity.ai.tickAccumulator >= entity.ai.tickInterval) {
             entity.ai.tickAccumulator -= entity.ai.tickInterval;
             const api = createWorldAPI(scene, entity);
-            tickNpcAI(entity, api, scene);
+            tickNpcAI(entity, api);
         }
     }
 }
 
 // --- Tick: orchestrator ---
 
-function tickNpcAI(entity: NPCEntity, api: WorldAPI, scene: Scene) {
+function tickNpcAI(entity: NPCEntity, api: WorldAPI) {
     const stage = getLifeStage(entity.age);
 
     // Tick down visual greeting bubble
     if (entity.ai.greetBubbleTimer > 0) {
         entity.ai.greetBubbleTimer -= entity.ai.tickInterval;
+    }
+
+    // Sync AI state with physical reality: if the world put us in a mating action, align AI state
+    if (entity.action?.type === 'mating' && entity.ai.state !== 'mating') {
+        entity.ai.state = 'mating';
+        entity.ai.targetId = entity.action.targetId ?? null;
     }
 
     // Babies: no AI, stay at home
@@ -127,14 +144,24 @@ function tickNpcAI(entity: NPCEntity, api: WorldAPI, scene: Scene) {
     }
 
     // Adolescents & Adults: full AI (with some gates)
-    processMessages(entity, api, scene);
+
+    // Sleeping is a special blocking state:
+    // - No message processing (messages are kept for when they wake up)
+    // - No social greetings
+    // - Only the sleeping handler runs
+    if (entity.ai.state === 'sleeping') {
+        handleSleeping(entity, api);
+        return;
+    }
+
+    processMessages(entity, api);
     tickGreetCooldowns(entity);
     trySocialGreeting(entity, api);
 
     if (entity.ai.state === 'idle') {
-        decideNextAction(entity, api, scene);
+        decideNextAction(entity, api);
     } else {
-        handleActiveState(entity, api, scene);
+        handleActiveState(entity, api);
     }
 }
 
@@ -157,17 +184,17 @@ function stayAtHome(entity: NPCEntity, api: WorldAPI) {
 //  IDLE: priority-based decision
 // =======================================================
 
-function decideNextAction(entity: NPCEntity, api: WorldAPI, scene: Scene) {
-    if (decideFight(entity, api, scene)) return;
+function decideNextAction(entity: NPCEntity, api: WorldAPI) {
+    if (decideFight(entity, api)) return;
     if (decideSurvival(entity, api)) return;
-    if (decideMaternalCare(entity, api, scene)) return;
-    if (decideParentalCare(entity, api, scene)) return;
+    if (decideMaternalCare(entity, api)) return;
+    if (decideParentalCare(entity, api)) return;
     if (decideBuildHome(entity, api)) return;
     if (decideInventory(entity, api)) return;
     if (decideMate(entity, api)) return;
     if (decideCourt(entity, api)) return;
-    if (decideTrade(entity, api, scene)) return;
-    if (decideCraft(entity, api, scene)) return;
+    if (decideTrade(entity, api)) return;
+    if (decideCraft(entity, api)) return;
     if (decideRest(entity, api)) return;
     if (decideGather(entity, api)) return;
     if (decideGatherWood(entity, api)) return;
@@ -175,23 +202,15 @@ function decideNextAction(entity: NPCEntity, api: WorldAPI, scene: Scene) {
 }
 
 /** Priority 1.5 — Parental care: if dependents at home and stock is low, gather urgently */
-function decideParentalCare(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
+function decideParentalCare(entity: NPCEntity, api: WorldAPI): boolean {
     if (getLifeStage(entity.age) !== 'adult') return false;
 
-    // Do I have children (via knowledge relations)?
-    const childIds = entity.knowledge.relations
-        .filter((r) => r.type === 'child')
-        .map((r) => r.targetId);
-
-    if (childIds.length === 0) return false;
+    // Do I have children (via WorldAPI)?
+    const children = api.getChildInfos();
+    if (children.length === 0) return false;
 
     // Higher threshold if there's a baby at home
-    const hasLivingBaby = childIds.some((cid) => {
-        const child = scene.entities.find(
-            (e): e is NPCEntity => e.id === cid && e.type === 'npc'
-        );
-        return child && child.age < AGE_BABY;
-    });
+    const hasLivingBaby = children.some((c) => c.age < AGE_BABY);
     const stockMin = hasLivingBaby ? PARENTAL_STOCK_MIN_BABY : PARENTAL_STOCK_MIN;
 
     // Check if home stock is critically low
@@ -239,6 +258,7 @@ function decideBuildHome(entity: NPCEntity, api: WorldAPI): boolean {
         const built = api.buildCabin();
         if (built) {
             entity.ai.state = 'idle';
+            logAction(entity, 0, 'Construit une cabane', '🏠');
             return true;
         }
     }
@@ -249,6 +269,7 @@ function decideBuildHome(entity: NPCEntity, api: WorldAPI): boolean {
         entity.ai.targetId = target.id;
         api.moveTo(target.position);
         entity.ai.state = 'moving';
+        logAction(entity, 0, `Récolte bois pour cabane (${woodCount}/${CABIN_WOOD_COST})`, '🪵');
         logger.debug('AI', `${entity.name} gathering wood for home (${woodCount}/${CABIN_WOOD_COST})`);
         return true;
     }
@@ -266,28 +287,24 @@ function decideBuildHome(entity: NPCEntity, api: WorldAPI): boolean {
 }
 
 /** Priority 0 — Combat: check for hostile NPCs nearby */
-function decideFight(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
+function decideFight(entity: NPCEntity, api: WorldAPI): boolean {
     if (getLifeStage(entity.age) !== 'adult') return false;
     if (entity.ai.attackCooldown > 0) return false;
 
     // Check for hostile NPCs in aggro range
-    const nearbyNpcs = api.getNearbyNPCs(AGGRO_RANGE);
+    const nearbyNpcs = api.getNearbyNPCInfos(AGGRO_RANGE);
 
     for (const other of nearbyNpcs) {
-        const otherNpc = scene.entities.find(
-            (e): e is NPCEntity => e.id === other.id && e.type === 'npc'
-        );
-        if (!otherNpc) continue;
-        if (getLifeStage(otherNpc.age) !== 'adult') continue;
+        if (other.stage !== 'adult') continue;
 
-        // Check faction hostility
-        if (!areFactionsHostile(entity, otherNpc)) continue;
+        // Check faction hostility (uses NPC IDs)
+        if (!areFactionsHostile(entity.id, other.id)) continue;
 
-        // Decide fight or flee
-        if (shouldFlee(entity, otherNpc)) {
+        // Assess threat through biased perception
+        if (shouldFleeFrom(entity, other)) {
             // Flee: move away from enemy
-            const dx = entity.position.x - otherNpc.position.x;
-            const dy = entity.position.y - otherNpc.position.y;
+            const dx = entity.position.x - other.position.x;
+            const dy = entity.position.y - other.position.y;
             const len = Math.sqrt(dx * dx + dy * dy) || 1;
             const fleeTarget = {
                 x: entity.position.x + (dx / len) * 200,
@@ -296,15 +313,17 @@ function decideFight(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
             api.moveTo(fleeTarget);
             entity.ai.state = 'fleeing';
             entity.ai.targetId = other.id;
-            logger.info('AI', `${entity.name} flees from ${otherNpc.name}!`);
+            logger.info('AI', `${entity.name} flees from ${other.name}!`);
+            logAction(entity, 0, `Fuit ${other.name}`, '🏃');
             return true;
         }
 
         // Fight: engage
         entity.ai.targetId = other.id;
         entity.ai.state = 'fighting';
-        api.moveTo(otherNpc.position);
-        logger.info('AI', `${entity.name} engages ${otherNpc.name} in combat!`);
+        api.moveTo(other.position);
+        logger.info('AI', `${entity.name} engages ${other.name} in combat!`);
+        logAction(entity, 0, `Combat contre ${other.name}`, '⚔️');
         return true;
     }
 
@@ -319,6 +338,7 @@ function decideSurvival(entity: NPCEntity, api: WorldAPI): boolean {
         if (cabin) {
             api.moveTo(cabin.position);
             entity.ai.state = 'going_to_cabin';
+            logAction(entity, 0, 'Va dormir (fatigue)', '😴');
             return true;
         }
     }
@@ -332,6 +352,7 @@ function decideSurvival(entity: NPCEntity, api: WorldAPI): boolean {
         if (cabin) {
             api.moveTo(cabin.position);
             entity.ai.state = 'going_to_eat';
+            logAction(entity, 0, hungry ? 'Va manger' : 'Va boire', hungry ? '🍖' : '💧');
             logger.debug('AI', `${entity.name} hungry/thirsty → going home to eat`);
             return true;
         }
@@ -366,6 +387,7 @@ function decideMate(entity: NPCEntity, api: WorldAPI): boolean {
     logger.info('AI', `${entity.name} desire=${Math.round(entity.reproduction.desire)} → going home to mate`);
     api.moveTo(cabin.position);
     entity.ai.state = 'going_to_mate';
+    logAction(entity, 0, 'Rentre pour se reproduire', '💕');
     return true;
 }
 
@@ -387,27 +409,20 @@ function decideCourt(entity: NPCEntity, api: WorldAPI): boolean {
     entity.ai.targetId = mate.id;
     api.moveTo(mate.position);
     entity.ai.state = 'courting';
+    logAction(entity, 0, 'Courtise une partenaire', '💘');
     return true;
 }
 
 /** Priority 1.2 — Maternal care: mother stays home with baby (age < AGE_BABY) */
-function decideMaternalCare(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
+function decideMaternalCare(entity: NPCEntity, api: WorldAPI): boolean {
     if (entity.sex !== 'female') return false;
     if (getLifeStage(entity.age) !== 'adult') return false;
 
     // Check if I have a living baby (age < AGE_BABY)
-    const childIds = entity.knowledge.relations
-        .filter((r) => r.type === 'child')
-        .map((r) => r.targetId);
+    const children = api.getChildInfos();
+    if (children.length === 0) return false;
 
-    if (childIds.length === 0) return false;
-
-    const hasLivingBaby = childIds.some((cid) => {
-        const child = scene.entities.find(
-            (e): e is NPCEntity => e.id === cid && e.type === 'npc'
-        );
-        return child && child.age < AGE_BABY;
-    });
+    const hasLivingBaby = children.some((c) => c.age < AGE_BABY);
 
     if (!hasLivingBaby) return false;
 
@@ -447,6 +462,7 @@ function decideRest(entity: NPCEntity, api: WorldAPI): boolean {
     const duration = REST_MIN_DURATION + Math.random() * (REST_MAX_DURATION - REST_MIN_DURATION);
     entity.ai.restTimer = duration;
     entity.ai.state = 'resting';
+    logAction(entity, 0, 'Se repose', '☀️');
     logger.debug('AI', `${entity.name} decides to rest for ${Math.round(duration / SECONDS_PER_HOUR)}h`);
     return true;
 }
@@ -458,7 +474,7 @@ function decideRest(entity: NPCEntity, api: WorldAPI): boolean {
 const CRAFT_CHECK_CHANCE = 0.3;  // 30% chance per AI tick to check crafting
 
 /** Priority 3.3 — Craft: if NPC has a job and the right resources in stock, start crafting */
-function decideCraft(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
+function decideCraft(entity: NPCEntity, api: WorldAPI): boolean {
     if (!entity.job) return false;
     if (getLifeStage(entity.age) !== 'adult') return false;
     if (!entity.homeId) return false;
@@ -474,12 +490,6 @@ function decideCraft(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
     const recipes = getRecipesForJob(entity.job);
     if (recipes.length === 0) return false;
 
-    // Check stock for required inputs
-    const stock = scene.entities.find(
-        (e): e is StockEntity => e.type === 'stock' && e.cabinId === entity.homeId
-    );
-    if (!stock) return false;
-
     // Check building requirement
     const nearbyBuildings = api.getNearbyBuildings(100);
 
@@ -490,11 +500,15 @@ function decideCraft(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
             if (!hasBuilding) continue;
         }
 
-        // Check inputs
-        if (!hasAllItems(stock.items, recipe.inputs)) continue;
+        // Check inputs via WorldAPI
+        const hasInputs = recipe.inputs.every(
+            (input) => api.getStockCount(input.itemId) >= input.quantity
+        );
+        if (!hasInputs) continue;
 
         // Start crafting!
         logger.info('CRAFT', `${entity.name} starts crafting ${recipe.displayName}`);
+        logAction(entity, 0, `Fabrique : ${recipe.displayName}`, '🔨');
         entity.ai.state = 'crafting';
 
         // Move to stock if not already there
@@ -504,7 +518,9 @@ function decideCraft(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
         }
 
         // Start the craft action via API
-        api.craft(recipe.id);
+        if (api.craft(recipe.id)) {
+            entity.ai.craftRecipeId = recipe.id;
+        }
         return true;
     }
 
@@ -543,20 +559,19 @@ function evaluateStock(api: WorldAPI): StockBalance {
     return { food, water, wood, surplus, deficit };
 }
 
-function evaluateOtherStock(scene: Scene, npcId: string): StockBalance | null {
-    const npc = scene.entities.find(
-        (e): e is NPCEntity => e.id === npcId && e.type === 'npc'
-    );
-    if (!npc || !npc.homeId) return null;
+function evaluateOtherStock(observer: NPCEntity, api: WorldAPI, npcId: string): StockBalance | null {
+    const npcInfo = api.getNPCInfo(npcId);
+    if (!npcInfo || !npcInfo.homeId) return null;
 
-    const stock = scene.entities.find(
-        (e): e is StockEntity => e.type === 'stock' && e.cabinId === npc.homeId
-    );
-    if (!stock) return null;
+    // Get real counts via WorldAPI, then perceive them with biased perception
+    const realFood = api.getStockCountOf(npcId, 'food');
+    const realWater = api.getStockCountOf(npcId, 'water');
+    const realWood = api.getStockCountOf(npcId, 'wood');
+    const perceived = perceiveStock(observer, realFood, realWater, realWood);
 
-    const food = countItem(stock.items, 'food');
-    const water = countItem(stock.items, 'water');
-    const wood = countItem(stock.items, 'wood');
+    const food = perceived.food;
+    const water = perceived.water;
+    const wood = perceived.wood;
 
     const surplus: string[] = [];
     const deficit: string[] = [];
@@ -581,7 +596,7 @@ function evaluateOtherStock(scene: Scene, npcId: string): StockBalance | null {
  *  2. Go to trade partner
  *  3. Give surplus, receive deficit via trade_offer message
  */
-function decideTrade(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
+function decideTrade(entity: NPCEntity, api: WorldAPI): boolean {
     if (!entity.homeId) return false;
     if (getLifeStage(entity.age) !== 'adult') return false;
 
@@ -596,7 +611,7 @@ function decideTrade(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
         const known = entity.knowledge.npcs.find((n) => n.id === other.id);
         if (!known || known.affinity < TRADE_MIN_AFFINITY) continue;
 
-        const otherBalance = evaluateOtherStock(scene, other.id);
+        const otherBalance = evaluateOtherStock(entity, api, other.id);
         if (!otherBalance) continue;
 
         // Find a matching trade: my surplus → their deficit, their surplus → my deficit
@@ -608,6 +623,7 @@ function decideTrade(entity: NPCEntity, api: WorldAPI, scene: Scene): boolean {
 
                 // Match found! Go home to pick up the surplus
                 logger.info('TRADE', `${entity.name} wants to trade ${offer} for ${want} with NPC ${other.id}`);
+                logAction(entity, 0, `Commerce : ${offer} → ${want}`, '🤝');
 
                 // Store trade info in AI state
                 entity.ai.targetId = other.id;
@@ -642,6 +658,9 @@ function decideGather(entity: NPCEntity, api: WorldAPI): boolean {
     // This creates natural specialization: scouts explore while gatherers pick up nearby resources
     const isExplorer = prefersExploration(entity);
 
+    const resLabel = resourceType === 'food' ? 'nourriture' : resourceType === 'water' ? 'eau' : 'bois';
+    const resIcon = resourceType === 'food' ? '🌾' : resourceType === 'water' ? '💧' : '🪵';
+
     if (!isExplorer) {
         // Gatherer: grab nearest visible resource first
         const target = api.getNearest(resourceType);
@@ -649,6 +668,7 @@ function decideGather(entity: NPCEntity, api: WorldAPI): boolean {
             entity.ai.targetId = target.id;
             api.moveTo(target.position);
             entity.ai.state = 'moving';
+            logAction(entity, 0, `Récolte ${resLabel}`, resIcon);
             return true;
         }
     }
@@ -658,6 +678,7 @@ function decideGather(entity: NPCEntity, api: WorldAPI): boolean {
     if (knownZone) {
         api.moveTo(knownZone.position);
         entity.ai.state = 'searching';
+        logAction(entity, 0, `Cherche ${resLabel}`, '🔍');
         return true;
     }
 
@@ -668,6 +689,7 @@ function decideGather(entity: NPCEntity, api: WorldAPI): boolean {
             entity.ai.targetId = target.id;
             api.moveTo(target.position);
             entity.ai.state = 'moving';
+            logAction(entity, 0, `Récolte ${resLabel}`, resIcon);
             return true;
         }
     }
@@ -734,13 +756,14 @@ function decideExplore(entity: NPCEntity, api: WorldAPI) {
 
     api.moveTo({ x: targetX, y: targetY });
     entity.ai.state = 'searching';
+    logAction(entity, 0, 'Explore les environs', '🧭');
 }
 
 // =======================================================
 //  ACTIVE STATE HANDLERS
 // =======================================================
 
-function handleActiveState(entity: NPCEntity, api: WorldAPI, scene: Scene) {
+function handleActiveState(entity: NPCEntity, api: WorldAPI) {
     switch (entity.ai.state) {
         case 'moving': return handleMoving(entity, api);
         case 'taking': return handleTaking(entity, api);
@@ -749,14 +772,14 @@ function handleActiveState(entity: NPCEntity, api: WorldAPI, scene: Scene) {
         case 'going_to_eat': return handleGoingToEat(entity, api);
         case 'sleeping': return handleSleeping(entity, api);
         case 'resting': return handleResting(entity, api);
-        case 'trading': return handleTrading(entity, api, scene);
+        case 'trading': return handleTrading(entity, api);
         case 'returning': return handleReturning(entity, api);
         case 'courting': return handleCourting(entity, api);
-        case 'going_to_mate': return handleGoingToMate(entity, api, scene);
+        case 'going_to_mate': return handleGoingToMate(entity, api);
         case 'mating': return handleMating(entity);
         case 'waiting_for_mate': return handleWaitingForMate(entity, api);
         case 'crafting': return handleCrafting(entity);
-        case 'fighting': return handleFighting(entity, api, scene);
+        case 'fighting': return handleFighting(entity, api);
         case 'fleeing': return handleFleeing(entity, api);
     }
 }
@@ -850,9 +873,100 @@ function handleGoingToEat(entity: NPCEntity, api: WorldAPI) {
 
 /** Sleeping; wake up when energy is well restored */
 function handleSleeping(entity: NPCEntity, api: WorldAPI) {
+    // Consolidate knowledge during sleep (once per sleep cycle, at ~50% energy)
+    if (!entity.ai.sleepConsolidated && entity.needs.energy >= 50) {
+        entity.ai.sleepConsolidated = true;
+        consolidateKnowledge(entity);
+    }
+
     if (entity.needs.energy >= 95) {
         api.wakeUp();
         entity.ai.state = 'idle';
+        entity.ai.sleepConsolidated = false;
+        logAction(entity, 0, 'Se réveille', '☀️');
+    }
+}
+
+// =======================================================
+//  SLEEP: KNOWLEDGE CONSOLIDATION
+// =======================================================
+
+/**
+ * During sleep, the NPC's brain consolidates knowledge.
+ * Nearby zone memories of the same resource type are merged:
+ * - Positions converge towards each other (weighted by confidence)
+ * - Confidence of the merged entry increases slightly
+ * - Hearsay gets upgraded towards firsthand if both sources agree
+ * - Low-confidence memories fade away
+ *
+ * This is gradual: each night refines the mental map a bit more.
+ */
+const CONSOLIDATION_MERGE_RADIUS = 180;  // px — merge threshold (wider than active sharing)
+const CONSOLIDATION_FADE_AMOUNT = 0.05;  // confidence lost per night for hearsay
+const CONSOLIDATION_BOOST = 0.08;        // confidence gained when merging two entries
+const MIN_CONFIDENCE_KEEP = 0.05;        // below this, forget the zone
+
+function consolidateKnowledge(entity: NPCEntity) {
+    const zones = entity.knowledge.locations;
+    if (zones.length < 2) return;
+
+    let didMerge = true;
+    let mergeCount = 0;
+
+    // Iterative merge pass — keep merging until stable
+    while (didMerge) {
+        didMerge = false;
+
+        for (let i = 0; i < zones.length; i++) {
+            for (let j = i + 1; j < zones.length; j++) {
+                const a = zones[i];
+                const b = zones[j];
+
+                // Only merge same resource type
+                if (a.resourceType !== b.resourceType) continue;
+
+                const dist = distance(a.position, b.position);
+                if (dist > CONSOLIDATION_MERGE_RADIUS) continue;
+
+                // Merge b into a (weighted by confidence)
+                const totalConf = a.confidence + b.confidence;
+                const wA = a.confidence / totalConf;
+                const wB = b.confidence / totalConf;
+
+                // Smooth position convergence
+                a.position.x = a.position.x * wA + b.position.x * wB;
+                a.position.y = a.position.y * wA + b.position.y * wB;
+
+                // Confidence boost from corroboration
+                a.confidence = Math.min(1, Math.max(a.confidence, b.confidence) + CONSOLIDATION_BOOST);
+
+                // Source upgrade: if either is firsthand, the merged memory is firsthand
+                if (b.source === 'firsthand') {
+                    a.source = 'firsthand';
+                }
+
+                // Remove b
+                zones.splice(j, 1);
+                j--;
+                didMerge = true;
+                mergeCount++;
+            }
+        }
+    }
+
+    // Fade low-confidence hearsay (unreinforced rumors decay)
+    for (const zone of zones) {
+        if (zone.source === 'hearsay') {
+            zone.confidence -= CONSOLIDATION_FADE_AMOUNT;
+        }
+    }
+
+    // Forget zones below minimum confidence
+    entity.knowledge.locations = zones.filter((z) => z.confidence >= MIN_CONFIDENCE_KEEP);
+
+    if (mergeCount > 0) {
+        logAction(entity, 0, `Consolide ${mergeCount} souvenir${mergeCount > 1 ? 's' : ''}`, '🧠');
+        logger.debug('KNOWLEDGE', `${entity.name} consolidated ${mergeCount} zone memories during sleep`);
     }
 }
 
@@ -888,7 +1002,7 @@ function handleResting(entity: NPCEntity, api: WorldAPI) {
 }
 
 /** Trading: multi-phase barter flow */
-function handleTrading(entity: NPCEntity, api: WorldAPI, scene: Scene) {
+function handleTrading(entity: NPCEntity, api: WorldAPI) {
     const { tradeOffer, tradeWant, tradePhase } = entity.ai;
     if (!tradeOffer || !tradeWant || !tradePhase) {
         cancelTrade(entity);
@@ -898,11 +1012,9 @@ function handleTrading(entity: NPCEntity, api: WorldAPI, scene: Scene) {
     const partnerId = entity.ai.targetId;
     if (!partnerId) { cancelTrade(entity); return; }
 
-    // Check partner still exists
-    const partner = scene.entities.find(
-        (e): e is NPCEntity => e.id === partnerId && e.type === 'npc'
-    );
-    if (!partner) { cancelTrade(entity); return; }
+    // Check partner still exists via WorldAPI
+    const partnerInfo = api.getNPCInfo(partnerId);
+    if (!partnerInfo) { cancelTrade(entity); return; }
 
     switch (tradePhase) {
         case 'going_home': {
@@ -917,18 +1029,18 @@ function handleTrading(entity: NPCEntity, api: WorldAPI, scene: Scene) {
             }
 
             // Now go to the trade partner
-            api.moveTo(partner.position);
+            api.moveTo(partnerInfo.position);
             entity.ai.tradePhase = 'going_to_partner';
             return;
         }
 
         case 'going_to_partner': {
             // Track live position of partner
-            const partnerInfo = api.getEntity(partnerId);
-            if (!partnerInfo) { cancelTrade(entity); return; }
+            const livePartner = api.getEntity(partnerId);
+            if (!livePartner) { cancelTrade(entity); return; }
 
-            if (partnerInfo.distance > 30) {
-                api.moveTo(partnerInfo.position);
+            if (livePartner.distance > 30) {
+                api.moveTo(livePartner.position);
                 return;
             }
 
@@ -953,19 +1065,15 @@ function handleTrading(entity: NPCEntity, api: WorldAPI, scene: Scene) {
                 return;
             }
 
-            // Check if partner has the item I want in their inventory (they picked it up from the message handler)
-            const hasWanted = countItem(partner.inventory, tradeWant) > 0;
-            if (hasWanted) {
-                // Partner gives me the item
-                removeItem(partner.inventory, tradeWant, 1);
-                addItem(entity.inventory, tradeWant, 1);
-                logger.info('TRADE', `${entity.name} traded ${tradeOffer} for ${tradeWant} with ${partner.name}`);
+            // Take the wanted item from partner via WorldAPI (mediated exchange)
+            const took = api.takeItemFrom(partnerId, tradeWant);
+            if (took) {
+                logger.info('TRADE', `${entity.name} traded ${tradeOffer} for ${tradeWant} with ${partnerInfo.name}`);
+                logAction(entity, 0, `Échange ${tradeOffer} ↔ ${tradeWant} avec ${partnerInfo.name}`, '✅');
 
-                // Boost affinity for both
+                // Boost affinity for self (partner's affinity is managed via their own AI)
                 const myKnown = entity.knowledge.npcs.find((n) => n.id === partnerId);
                 if (myKnown) myKnown.affinity = Math.min(1, myKnown.affinity + 0.05);
-                const theirKnown = partner.knowledge.npcs.find((n) => n.id === entity.id);
-                if (theirKnown) theirKnown.affinity = Math.min(1, theirKnown.affinity + 0.05);
             } else {
                 logger.debug('TRADE', `${entity.name}: partner didn't have ${tradeWant}, one-way gift`);
             }
@@ -995,6 +1103,7 @@ function handleReturning(entity: NPCEntity, api: WorldAPI) {
     if (entity.movement) return;
 
     api.deposit();
+    logAction(entity, 0, 'Dépose au stock', '📦');
     entity.ai.state = 'idle';
 }
 
@@ -1013,19 +1122,21 @@ function handleCourting(entity: NPCEntity, api: WorldAPI) {
     // Active pursuit: track live position
     api.moveTo(target.position);
 
-    // Close enough → propose to form a couple (not mate immediately)
+    // Close enough → form the couple (the female already accepted via court_request message)
     if (target.distance <= PROPOSE_DISTANCE) {
         api.stop();
-        const accepted = api.propose(target.id);
+        const formed = api.formCouple(target.id);
 
-        if (accepted) {
+        if (formed) {
             // Couple formed! Go back to idle — mating will happen later at home
             logger.info('AI', `${entity.name} → couple formed with ${target.id}!`);
+            logAction(entity, 0, 'Couple formé !', '💑');
             entity.reproduction.desire *= 0.3; // desire partially satisfied by forming couple
             entity.ai.targetId = null;
             entity.ai.state = 'idle';
         } else {
-            logger.info('AI', `${entity.name} → rejected, desire halved`);
+            logger.info('AI', `${entity.name} → could not form couple`);
+            logAction(entity, 0, 'Rejeté...', '💔');
             entity.reproduction.desire *= 0.5;
             entity.ai.targetId = null;
             entity.ai.state = 'idle';
@@ -1034,7 +1145,7 @@ function handleCourting(entity: NPCEntity, api: WorldAPI) {
 }
 
 /** Male going home to mate with partner; when arrived, propose mating */
-function handleGoingToMate(entity: NPCEntity, api: WorldAPI, scene: Scene) {
+function handleGoingToMate(entity: NPCEntity, api: WorldAPI) {
     if (entity.movement) return; // still walking
 
     // We're home — find partner
@@ -1044,35 +1155,35 @@ function handleGoingToMate(entity: NPCEntity, api: WorldAPI, scene: Scene) {
         return;
     }
 
-    const partner = scene.entities.find(
-        (e): e is NPCEntity => e.id === partnerId && e.type === 'npc'
-    );
-    if (!partner) {
+    const partnerInfo = api.getNPCInfo(partnerId);
+    if (!partnerInfo) {
         entity.ai.state = 'idle';
         return;
     }
 
     // Partner must be nearby (at home too)
-    const dist = api.getEntity(partnerId);
-    if (!dist || dist.distance > PROPOSE_DISTANCE * 2) {
+    if (partnerInfo.distance > PROPOSE_DISTANCE * 2) {
         // Partner is not home — wait a bit then give up
         logger.debug('AI', `${entity.name}: partner not home, going idle`);
         entity.ai.state = 'idle';
         return;
     }
 
-    // Partner must not be busy
-    if (partner.action !== null) {
+    // Partner must not be busy (visible state indicates availability)
+    if (partnerInfo.visibleState !== 'idle' && partnerInfo.visibleState !== 'waiting_for_mate') {
         entity.ai.state = 'idle';
         return;
     }
 
-    // Propose mating
-    const accepted = api.propose(partnerId);
-    if (accepted) {
+    // Start mating via WorldAPI (physical mechanics only)
+    const result = api.startMating(partnerId);
+    if (result.success) {
         logger.info('AI', `${entity.name} → mating at home!`);
+        logAction(entity, 0, 'Reproduction', '💕');
         entity.ai.state = 'mating';
+        // Female's AI will detect the mating action on next tick and sync state
     } else {
+        logger.debug('AI', `${entity.name}: mating failed (${result.reason})`);
         entity.reproduction.desire *= 0.7;
         entity.ai.state = 'idle';
     }
@@ -1087,22 +1198,26 @@ function handleMating(entity: NPCEntity) {
 }
 
 /** Fighting: move towards enemy and attack when in range */
-function handleFighting(entity: NPCEntity, api: WorldAPI, scene: Scene) {
-    const target = entity.ai.targetId ? scene.entities.find(
-        (e): e is NPCEntity => e.id === entity.ai.targetId && e.type === 'npc'
-    ) : null;
+function handleFighting(entity: NPCEntity, api: WorldAPI) {
+    const targetId = entity.ai.targetId;
+    if (!targetId) {
+        entity.ai.state = 'idle';
+        return;
+    }
+
+    const targetInfo = api.getNPCInfo(targetId);
 
     // Target gone or dead
-    if (!target || target.needs.health <= 0) {
+    if (!targetInfo || !targetInfo.isAlive) {
         entity.ai.targetId = null;
         entity.ai.state = 'idle';
         return;
     }
 
     // Should we flee now?
-    if (shouldFlee(entity, target)) {
-        const dx = entity.position.x - target.position.x;
-        const dy = entity.position.y - target.position.y;
+    if (shouldFleeFrom(entity, targetInfo)) {
+        const dx = entity.position.x - targetInfo.position.x;
+        const dy = entity.position.y - targetInfo.position.y;
         const len = Math.sqrt(dx * dx + dy * dy) || 1;
         api.moveTo({
             x: entity.position.x + (dx / len) * 200,
@@ -1112,25 +1227,21 @@ function handleFighting(entity: NPCEntity, api: WorldAPI, scene: Scene) {
         return;
     }
 
-    const dist = Math.sqrt(
-        (entity.position.x - target.position.x) ** 2 +
-        (entity.position.y - target.position.y) ** 2
-    );
-
-    if (dist > ATTACK_RANGE) {
+    if (targetInfo.distance > ATTACK_RANGE) {
         // Move closer
-        api.moveTo(target.position);
+        api.moveTo(targetInfo.position);
     } else {
-        // In range — attack
+        // In range — attack via WorldAPI
         api.stop();
         if (entity.ai.attackCooldown <= 0) {
-            resolveAttack(entity, target);
+            api.attack(targetId);
             entity.ai.attackCooldown = ATTACK_COOLDOWN;
         }
     }
 }
 
 /** Fleeing: run away, return to idle when far enough */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function handleFleeing(entity: NPCEntity, api: WorldAPI) {
     if (!entity.movement) {
         // Arrived at flee destination, go idle
@@ -1179,14 +1290,20 @@ function trySocialGreeting(entity: NPCEntity, api: WorldAPI) {
     if (entity.action?.type === 'sleep' || entity.action?.type === 'mating') return;
     if (entity.ai.state === 'sleeping' || entity.ai.state === 'going_to_cabin') return;
 
-    const nearby = api.getNearbyNPCs(GREETING_RANGE);
-    if (nearby.length === 0) return;
+    const nearbyInfos = api.getNearbyNPCInfos(GREETING_RANGE);
+    if (nearbyInfos.length === 0) return;
 
     // Sociability factor: charisma makes NPCs greet more readily
     // Low charisma NPCs have a chance to skip greeting this tick
     if (Math.random() > 0.3 + entity.traits.charisma * 0.7) return;
 
-    for (const other of nearby) {
+    for (const other of nearbyInfos) {
+        // Use perception to assess the other NPC
+        const perceived = perceiveNPC(entity, other);
+
+        // Don't greet a sleeping NPC — we can see they're asleep
+        if (perceived.isSleeping) continue;
+
         const known = getOrCreateKnownNPC(entity, other.id);
         if (known.greetCooldown > 0) continue;
 
@@ -1198,8 +1315,16 @@ function trySocialGreeting(entity: NPCEntity, api: WorldAPI) {
         // Show greeting bubble on the greeter
         entity.ai.greetBubbleTimer = GREET_BUBBLE_DURATION;
 
-        // Send greeting message to the other NPC
-        api.sendMessage(other.id, { type: 'greeting', fromId: entity.id });
+        // Send greeting message to the other NPC, including knowledge to share
+        const zonesToShare = entity.knowledge.locations
+            .filter((z) => z.confidence >= 0.3)
+            .map((z) => ({
+                position: { x: z.position.x, y: z.position.y },
+                resourceType: z.resourceType,
+                confidence: z.confidence,
+                source: z.source,
+            }));
+        api.sendMessage(other.id, { type: 'greeting', fromId: entity.id, sharedZones: zonesToShare });
 
         logger.debug('SOCIAL', `${entity.name} greets ${other.id} (affinity→${known.affinity.toFixed(2)})`);
         break; // Only greet one NPC per tick
@@ -1216,8 +1341,8 @@ function getOrCreateKnownNPC(entity: NPCEntity, targetId: string): KnownNPC {
     return known;
 }
 
-/** Handle receiving a greeting: boost affinity for the sender + share knowledge */
-function handleGreeting(entity: NPCEntity, fromId: string, scene: Scene) {
+/** Handle receiving a greeting: boost affinity for the sender + integrate shared knowledge */
+function handleGreeting(entity: NPCEntity, fromId: string, sharedZones?: SharedZoneInfo[]) {
     const known = getOrCreateKnownNPC(entity, fromId);
 
     // Receiver's charisma influences how warmly they respond
@@ -1227,22 +1352,17 @@ function handleGreeting(entity: NPCEntity, fromId: string, scene: Scene) {
     // Show greeting bubble on receiver too
     entity.ai.greetBubbleTimer = GREET_BUBBLE_DURATION;
 
-    // Knowledge sharing: the sender shares their best zones with the receiver
-    const sender = scene.entities.find(
-        (e): e is NPCEntity => e.id === fromId && e.type === 'npc'
-    );
-    if (sender) {
-        shareKnowledge(sender, entity);
+    // Knowledge sharing: integrate zones that came with the greeting message
+    if (sharedZones && sharedZones.length > 0) {
+        integrateSharedZones(entity, sharedZones);
     }
 
     logger.debug('SOCIAL', `${entity.name} greeted by ${fromId} (affinity→${known.affinity.toFixed(2)})`);
 }
 
-/** Share known zone locations from sender to receiver (as hearsay) */
-function shareKnowledge(sender: NPCEntity, receiver: NPCEntity) {
-    for (const zone of sender.knowledge.locations) {
-        if (zone.confidence < 0.3) continue; // don't share low-confidence info
-
+/** Integrate shared zone info from a greeting message into receiver's knowledge */
+function integrateSharedZones(receiver: NPCEntity, zones: SharedZoneInfo[]) {
+    for (const zone of zones) {
         // Check if receiver already knows a zone nearby
         const existing = receiver.knowledge.locations.find(
             (z) => z.resourceType === zone.resourceType
@@ -1275,16 +1395,16 @@ function shareKnowledge(sender: NPCEntity, receiver: NPCEntity) {
 //  MESSAGE PROCESSING
 // =======================================================
 
-function processMessages(entity: NPCEntity, api: WorldAPI, scene: Scene) {
+function processMessages(entity: NPCEntity, api: WorldAPI) {
     if (entity.messages.length === 0) return;
 
     for (const msg of entity.messages) {
         if (msg.type === 'court_request') {
-            handleCourtRequest(entity, api, msg.fromId, scene);
+            handleCourtRequest(entity, api, msg.fromId);
         } else if (msg.type === 'greeting') {
-            handleGreeting(entity, msg.fromId, scene);
+            handleGreeting(entity, msg.fromId, msg.sharedZones);
         } else if (msg.type === 'trade_offer') {
-            handleTradeOffer(entity, api, msg, scene);
+            handleTradeOffer(entity, api, msg);
         }
     }
 
@@ -1292,10 +1412,10 @@ function processMessages(entity: NPCEntity, api: WorldAPI, scene: Scene) {
 }
 
 /** Handle a trade_offer: prepare the requested item in inventory for exchange */
-function handleTradeOffer(entity: NPCEntity, api: WorldAPI, msg: { fromId: string; offer: string; want: string }, scene: Scene) {
+function handleTradeOffer(entity: NPCEntity, api: WorldAPI, msg: { fromId: string; offer: string; want: string }) {
     // They are offering msg.offer and want msg.want from me
-    // Check if I have a surplus of what they want
-    const myStock = evaluateOtherStock(scene, entity.id);
+    // Check if I have a surplus of what they want (use our own stock via API)
+    const myStock = evaluateStock(api);
     if (!myStock) return;
 
     const count = msg.want === 'food' ? myStock.food : msg.want === 'water' ? myStock.water : myStock.wood;
@@ -1318,7 +1438,7 @@ function handleTradeOffer(entity: NPCEntity, api: WorldAPI, msg: { fromId: strin
     logger.info('TRADE', `${entity.name} accepts trade: giving ${msg.want} for ${msg.offer} from ${msg.fromId}`);
 }
 
-function handleCourtRequest(entity: NPCEntity, api: WorldAPI, maleId: string, scene: Scene) {
+function handleCourtRequest(entity: NPCEntity, api: WorldAPI, maleId: string) {
     if (entity.sex === 'male') return;
     if (getLifeStage(entity.age) !== 'adult') return;
     if (hasPartner(entity)) {
@@ -1349,18 +1469,21 @@ function handleCourtRequest(entity: NPCEntity, api: WorldAPI, maleId: string, sc
         return;
     }
 
-    // Perception of the male
-    const male = scene.entities.find(
-        (e): e is NPCEntity => e.id === maleId && e.type === 'npc'
-    );
-    if (male) {
-        const perception = perceive(entity, male);
-        if (!perception.looksHealthy) {
-            logger.debug('MSG', `${entity.name} ignores court: male unhealthy`);
+    // Perception of the male via biased perception layer
+    const maleInfo = api.getNPCInfo(maleId);
+    if (maleInfo) {
+        const perceived = perceiveNPC(entity, maleInfo);
+
+        if (perceived.isKnownRelative) {
+            logger.debug('MSG', `${entity.name} ignores court: known relative`);
             return;
         }
-        if (perception.isKnownRelative) {
-            logger.debug('MSG', `${entity.name} ignores court: known relative`);
+        if (!perceived.looksHealthy) {
+            logger.debug('MSG', `${entity.name} ignores court: male doesn't look healthy`);
+            return;
+        }
+        if (!maleInfo.isAlive) {
+            logger.debug('MSG', `${entity.name} ignores court: male not alive`);
             return;
         }
     }

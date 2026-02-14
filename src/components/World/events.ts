@@ -6,10 +6,10 @@
 import {
     BuildingEntity, NPCEntity, Scene, StockEntity, countItem, removeItem, addItem,
     getCalendar, SECONDS_PER_DAY, SECONDS_PER_SEASON,
-} from './Game.types';
-import { distance, Vector2D } from './Game.vector';
-import { logger } from './Game.logger';
-import { getAllFactions, getRelation, setRelation, getFactionOf, Faction } from './Game.factions';
+} from './types';
+import { distance, Vector2D } from '../Shared/vector';
+import { logger } from '../Shared/logger';
+import { getAllFactions, getRelation, setRelation, getFactionOf, Faction } from './factions';
 
 // =============================================================
 //  EVENT BUS

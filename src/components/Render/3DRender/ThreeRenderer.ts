@@ -4,17 +4,37 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { GameRenderer, registerRenderer } from './Game.renderer';
+import { GameRenderer, registerRenderer } from '../GameRenderer';
 import {
     BuildingEntity, Camera, CorpseEntity, FertileZoneEntity,
-    Highlight, NPCEntity, ResourceEntity, Scene, StockEntity,
+    Highlight, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity,
     getCalendar, getLifeStage, LifeStage,
-} from './Game.types';
-import { Vector2D } from './Game.vector';
+} from '../../World/types';
+import { getSpecies } from '../../World/flora';
+import { Vector2D } from '../../Shared/vector';
+import type { SoilGrid, SoilProperty } from '../../World/fertility';
+import type { HeightMap, BasinMap } from '../../World/heightmap';
+import { getHeightAt } from '../../World/heightmap';
+import type { SoilOverlay } from '../GameRenderer';
 
 // --- Scale: 1 game unit (px) = 0.1 three.js unit ---
 const SCALE = 0.1;
-const toWorld = (v: Vector2D) => new THREE.Vector3(v.x * SCALE, 0, v.y * SCALE);
+const HEIGHT_SCALE = SCALE; // height uses same scale
+
+/** Convert 2D world position to 3D, optionally using heightmap */
+let _activeHeightMap: HeightMap | null = null;
+const toWorld = (v: Vector2D) => {
+    const y = _activeHeightMap ? getHeightAt(_activeHeightMap, v.x, v.y) * HEIGHT_SCALE : 0;
+    return new THREE.Vector3(v.x * SCALE, y, v.y * SCALE);
+};
+
+// --- Soil overlay color palettes (same as Canvas2DRenderer) ---
+const SOIL_OVERLAY_COLORS: Record<SoilProperty, { r0: number; g0: number; b0: number; r1: number; g1: number; b1: number }> = {
+    humidity: { r0: 200, g0: 184, b0: 122, r1: 26, g1: 122, b1: 180 },
+    minerals: { r0: 180, g0: 170, b0: 150, r1: 160, g1: 100, b1: 30 },
+    organicMatter: { r0: 200, g0: 190, b0: 170, r1: 40, g1: 30, b1: 10 },
+    sunExposure: { r0: 60, g0: 60, b0: 80, r1: 255, g1: 240, b1: 140 },
+};
 
 // --- NPC sizes by life stage ---
 const NPC_HEIGHT: Record<LifeStage, number> = { baby: 0.4, child: 0.7, adolescent: 1.0, adult: 1.2 };
@@ -181,7 +201,6 @@ function createResourceMesh(entity: ResourceEntity): THREE.Mesh {
 
     if (entity.resourceType === 'wood') {
         // Tree trunk + top
-        const group = new THREE.Group();
         const trunkGeo = new THREE.CylinderGeometry(0.1, 0.12, 0.8, 6);
         const trunkMat = new THREE.MeshLambertMaterial({ color: '#5a3a1a' });
         const trunk = new THREE.Mesh(trunkGeo, trunkMat);
@@ -263,12 +282,40 @@ class ThreeRenderer implements GameRenderer {
     private corpseMeshes = new Map<string, THREE.Mesh>();
     private zoneMeshes = new Map<string, THREE.Mesh>();
     private stockLabels = new Map<string, THREE.Sprite>();
+    private plantMeshes = new Map<string, THREE.Group>();
     private highlightMesh: THREE.Mesh | null = null;
 
-    // Ground plane
+    // Ground
     private ground: THREE.Mesh | null = null;
+    private groundTextureApplied = false;
+    private groundHeightApplied = false;
+    private currentOverlay: SoilOverlay = undefined as unknown as SoilOverlay; // force first update
+    private groundTexture: THREE.CanvasTexture | null = null;
+    // Water mesh for lakes
+    private waterMesh: THREE.Mesh | null = null;
+    private waterGeometry: THREE.PlaneGeometry | null = null;
+    private waterTexture: THREE.CanvasTexture | null = null;
+    private waterUpdateTimer = 0;
+    private static readonly WATER_UPDATE_INTERVAL = 500; // ms between water mesh updates
     // Sun light
     private sunLight: THREE.DirectionalLight | null = null;
+
+    // Third-person player
+    private playerMesh: THREE.Group | null = null;
+    private playerPos = { x: 0, y: 0 }; // 2D world position (game units)
+    private playerAngle = 0;             // facing direction (radians, smoothed)
+    private thirdPerson = false;         // camera mode flag
+    private keysDown = new Set<string>();
+    private keyHandler: ((e: KeyboardEvent) => void) | null = null;
+    private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
+    // Camera orbit controlled by mouse
+    private cameraYaw = 0;               // horizontal orbit angle (radians)
+    private cameraPitch = 0.35;          // vertical angle (radians, 0 = horizontal)
+    private cameraDistance = 1;          // distance from player
+    private mouseMoveHandler: ((e: MouseEvent) => void) | null = null;
+    private pointerLockHandler: (() => void) | null = null;
+    private static readonly PLAYER_SPEED = 2; // game units per second
+    private static readonly MOUSE_SENSITIVITY = 0.001;
 
     init(container: HTMLElement): void {
         this.container = container;
@@ -332,25 +379,70 @@ class ThreeRenderer implements GameRenderer {
         this.highlightMesh.visible = false;
         this.threeScene.add(this.highlightMesh);
 
+        // --- Player mesh (third-person) ---
+        this.playerMesh = createMinecraftCharacter('#e74c3c', 'adult');
+        this.playerMesh.scale.setScalar(0.25);
+        this.playerMesh.visible = false;
+        this.threeScene.add(this.playerMesh);
+
+        // --- Keyboard handlers ---
+        this.keyHandler = (e: KeyboardEvent) => this.keysDown.add(e.key.toLowerCase());
+        this.keyUpHandler = (e: KeyboardEvent) => this.keysDown.delete(e.key.toLowerCase());
+        window.addEventListener('keydown', this.keyHandler);
+        window.addEventListener('keyup', this.keyUpHandler);
+
+        // --- Mouse look (pointer lock) ---
+        this.mouseMoveHandler = (e: MouseEvent) => {
+            if (!this.thirdPerson) return;
+            if (document.pointerLockElement !== this.renderer!.domElement) return;
+            this.cameraYaw -= e.movementX * ThreeRenderer.MOUSE_SENSITIVITY;
+            this.cameraPitch += e.movementY * ThreeRenderer.MOUSE_SENSITIVITY;
+            // Clamp pitch to avoid flipping
+            this.cameraPitch = Math.max(-0.2, Math.min(1.2, this.cameraPitch));
+        };
+        document.addEventListener('mousemove', this.mouseMoveHandler);
+
+        // Request pointer lock on click when in third-person
+        this.pointerLockHandler = () => {
+            if (this.thirdPerson && document.pointerLockElement !== this.renderer!.domElement) {
+                this.renderer!.domElement.requestPointerLock();
+            }
+        };
+        this.renderer.domElement.addEventListener('click', this.pointerLockHandler);
+
         // Initial resize
         const rect = container.getBoundingClientRect();
         this.resize(rect.width, rect.height);
     }
 
-    render(scene: Scene, camera: Camera, highlight: Highlight): void {
+    render(scene: Scene, camera: Camera, highlight: Highlight, soilOverlay?: SoilOverlay): void {
         if (!this.renderer || !this.threeScene || !this.threeCamera || !this.controls) return;
+
+        // Set active heightmap so toWorld() uses it
+        _activeHeightMap = scene.heightMap ?? null;
 
         const elapsed = this.clock.getElapsedTime();
 
-        // In 3D, OrbitControls owns the camera entirely — don't fight it.
-        // Only sync to game camera when following a focused NPC.
-        // (Game.tsx sets camera position to -npc.position when an NPC is focused)
+        // --- Apply heightmap geometry (once) ---
+        if (!this.groundHeightApplied && scene.heightMap && this.ground) {
+            this.applyHeightGeometry(scene.heightMap);
+            this.groundHeightApplied = true;
+        }
+
+        // --- Update ground texture when overlay changes ---
+        const overlay = soilOverlay ?? null;
+        if (overlay !== this.currentOverlay || !this.groundTextureApplied) {
+            this.currentOverlay = overlay;
+            this.updateGroundTexture(scene);
+            this.groundTextureApplied = true;
+        }
 
         // --- Night/day cycle ---
         const { nightFactor } = getCalendar(scene.time);
         this.updateLighting(nightFactor);
 
         // --- Sync entities ---
+        this.syncPlants(scene);
         this.syncNPCs(scene, elapsed, highlight);
         this.syncBuildings(scene);
         this.syncResources(scene);
@@ -359,8 +451,16 @@ class ThreeRenderer implements GameRenderer {
         this.syncStockLabels(scene);
         this.syncHighlight(highlight);
 
+        // --- Update water mesh (lakes) ---
+        this.updateWaterMesh(scene);
+
+        // --- Third-person player ---
+        this.updatePlayer(scene, elapsed);
+
         // --- Render ---
-        this.controls.update();
+        if (!this.thirdPerson) {
+            this.controls.update();
+        }
         this.renderer.render(this.threeScene, this.threeCamera);
     }
 
@@ -373,7 +473,108 @@ class ThreeRenderer implements GameRenderer {
         this.threeCamera.updateProjectionMatrix();
     }
 
+    /** Toggle third-person mode on/off. Returns the new state. */
+    setThirdPerson(enabled: boolean): boolean {
+        this.thirdPerson = enabled;
+        if (this.playerMesh) this.playerMesh.visible = enabled;
+        if (this.controls) this.controls.enabled = !enabled;
+        // Release pointer lock when leaving third-person
+        if (!enabled && document.pointerLockElement === this.renderer?.domElement) {
+            document.exitPointerLock();
+        }
+        return enabled;
+    }
+
+    isThirdPerson(): boolean {
+        return this.thirdPerson;
+    }
+
+    private updatePlayer(_scene: Scene, elapsed: number) {
+        if (!this.playerMesh || !this.threeCamera) return;
+
+        if (!this.thirdPerson) {
+            this.playerMesh.visible = false;
+            return;
+        }
+
+        this.playerMesh.visible = true;
+
+        const dt = this.clock.getDelta() || 1 / 60;
+        const speed = ThreeRenderer.PLAYER_SPEED;
+
+        // --- Forward / right derived from camera yaw (mouse-controlled) ---
+        const fwdX = Math.sin(this.cameraYaw);
+        const fwdZ = Math.cos(this.cameraYaw);
+        const rightX = -Math.cos(this.cameraYaw);
+        const rightZ = Math.sin(this.cameraYaw);
+
+        // --- Keyboard input → movement relative to camera direction ---
+        let moveX = 0, moveZ = 0;
+        const keys = this.keysDown;
+        if (keys.has('z') || keys.has('w') || keys.has('arrowup')) { moveX += fwdX; moveZ += fwdZ; }
+        if (keys.has('s') || keys.has('arrowdown')) { moveX -= fwdX; moveZ -= fwdZ; }
+        if (keys.has('q') || keys.has('a') || keys.has('arrowleft')) { moveX -= rightX; moveZ -= rightZ; }
+        if (keys.has('d') || keys.has('arrowright')) { moveX += rightX; moveZ += rightZ; }
+
+        const moving = moveX !== 0 || moveZ !== 0;
+
+        if (moving) {
+            const len = Math.sqrt(moveX * moveX + moveZ * moveZ);
+            moveX /= len;
+            moveZ /= len;
+
+            // Update game-space position
+            this.playerPos.x += (moveX / SCALE) * speed * dt;
+            this.playerPos.y += (moveZ / SCALE) * speed * dt;
+
+            // Character faces movement direction (smooth lerp)
+            const targetAngle = Math.atan2(moveX, moveZ);
+            let diff = targetAngle - this.playerAngle;
+            if (diff > Math.PI) diff -= Math.PI * 2;
+            if (diff < -Math.PI) diff += Math.PI * 2;
+            this.playerAngle += diff * 0.15;
+        }
+
+        // --- Position on terrain ---
+        const pos = toWorld(this.playerPos);
+        this.playerMesh.position.set(pos.x, pos.y, pos.z);
+        this.playerMesh.rotation.y = this.playerAngle;
+
+        // Walk animation
+        animateWalk(this.playerMesh, elapsed, moving);
+
+        // --- Camera orbits player via mouse yaw/pitch ---
+        const dist = this.cameraDistance;
+        const camX = pos.x - Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * dist;
+        const camY = pos.y + Math.sin(this.cameraPitch) * dist + 0.5;
+        const camZ = pos.z - Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * dist;
+
+        const targetCamPos = new THREE.Vector3(camX, camY, camZ);
+        this.threeCamera.position.lerp(targetCamPos, 0.15);
+
+        // Look at player
+        const lookTarget = new THREE.Vector3(pos.x, pos.y + 0.4, pos.z);
+        this.threeCamera.lookAt(lookTarget);
+    }
+
     destroy(): void {
+        // Remove keyboard listeners
+        if (this.keyHandler) window.removeEventListener('keydown', this.keyHandler);
+        if (this.keyUpHandler) window.removeEventListener('keyup', this.keyUpHandler);
+
+        // Remove mouse listeners
+        if (this.mouseMoveHandler) document.removeEventListener('mousemove', this.mouseMoveHandler);
+        if (this.pointerLockHandler && this.renderer) {
+            this.renderer.domElement.removeEventListener('click', this.pointerLockHandler);
+        }
+        if (document.pointerLockElement === this.renderer?.domElement) {
+            document.exitPointerLock();
+        }
+
+        // Dispose player mesh
+        if (this.playerMesh) this.disposeObject(this.playerMesh);
+        this.playerMesh = null;
+
         // Dispose all meshes
         this.npcMeshes.forEach((m) => this.disposeObject(m));
         this.buildingMeshes.forEach((m) => this.disposeObject(m));
@@ -381,6 +582,7 @@ class ThreeRenderer implements GameRenderer {
         this.corpseMeshes.forEach((m) => this.disposeObject(m));
         this.zoneMeshes.forEach((m) => this.disposeObject(m));
         this.stockLabels.forEach((m) => this.disposeObject(m));
+        this.plantMeshes.forEach((m) => this.disposeObject(m));
 
         this.npcMeshes.clear();
         this.buildingMeshes.clear();
@@ -388,6 +590,14 @@ class ThreeRenderer implements GameRenderer {
         this.corpseMeshes.clear();
         this.zoneMeshes.clear();
         this.stockLabels.clear();
+        this.plantMeshes.clear();
+
+        // Dispose water mesh
+        if (this.waterMesh) this.disposeObject(this.waterMesh);
+        this.waterMesh = null;
+        this.waterGeometry = null;
+        if (this.waterTexture) this.waterTexture.dispose();
+        this.waterTexture = null;
 
         this.controls?.dispose();
         this.renderer?.dispose();
@@ -431,6 +641,51 @@ class ThreeRenderer implements GameRenderer {
     //  SYNC METHODS
     // =============================================================
 
+    private syncPlants(scene: Scene) {
+        const plants = scene.entities.filter((e): e is PlantEntity => e.type === 'plant');
+        const activeIds = new Set(plants.map((p) => p.id));
+
+        // Remove gone plants
+        for (const [id, mesh] of this.plantMeshes) {
+            if (!activeIds.has(id)) {
+                this.threeScene!.remove(mesh);
+                this.disposeObject(mesh);
+                this.plantMeshes.delete(id);
+            }
+        }
+
+        for (const plant of plants) {
+            const species = getSpecies(plant.speciesId);
+            if (!species) continue;
+
+            let group = this.plantMeshes.get(plant.id);
+            const stageTag = (group as unknown as { _stage?: string })?._stage;
+
+            // Recreate mesh when stage changes (seed→sprout→growing→mature→dead)
+            if (group && stageTag !== plant.stage) {
+                this.threeScene!.remove(group);
+                this.disposeObject(group);
+                group = undefined;
+                this.plantMeshes.delete(plant.id);
+            }
+
+            if (!group) {
+                group = createPlantMesh(plant, species.id, species.color, species.matureColor, species.maxSize);
+                (group as unknown as { _stage: string })._stage = plant.stage;
+                this.threeScene!.add(group);
+                this.plantMeshes.set(plant.id, group);
+            }
+
+            // Update position (Y from heightmap)
+            const pos = toWorld(plant.position);
+            group.position.set(pos.x, pos.y, pos.z);
+
+            // Update scale based on growth (within a stage)
+            const s = Math.max(0.15, plant.growth) * 0.5;
+            group.scale.setScalar(s);
+        }
+    }
+
     private syncNPCs(scene: Scene, elapsed: number, highlight: Highlight) {
         const npcs = scene.entities.filter((e): e is NPCEntity => e.type === 'npc');
         const activeIds = new Set(npcs.map((n) => n.id));
@@ -465,9 +720,9 @@ class ThreeRenderer implements GameRenderer {
                 this.npcMeshes.set(npc.id, group);
             }
 
-            // Position
+            // Position (Y from heightmap)
             const pos = toWorld(npc.position);
-            group.position.set(pos.x, 0, pos.z);
+            group.position.set(pos.x, pos.y, pos.z);
 
             // Face movement direction
             if (npc.movement) {
@@ -720,6 +975,313 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
+    // --- Ground geometry (heightmap) ---
+
+    private applyHeightGeometry(heightMap: HeightMap) {
+        if (!this.ground || !this.threeScene) return;
+
+        const { cols, rows, cellSize, originX, originY, data } = heightMap;
+        // PlaneGeometry(width, height, segs, segs) with N-1 segments gives N vertices.
+        // Vertex spacing = width / (N-1). We want spacing = cellSize * SCALE,
+        // so width = (cols-1) * cellSize * SCALE to get cols vertices at exactly cellSize apart.
+        const worldW = (cols - 1) * cellSize * SCALE;
+        const worldH = (rows - 1) * cellSize * SCALE;
+        // Center: first vertex at originX*SCALE, last at (originX + (cols-1)*cellSize)*SCALE
+        const centerX = (originX + (cols - 1) * cellSize / 2) * SCALE;
+        const centerZ = (originY + (rows - 1) * cellSize / 2) * SCALE;
+
+        const geo = new THREE.PlaneGeometry(worldW, worldH, cols - 1, rows - 1);
+        const posAttr = geo.getAttribute('position');
+
+        for (let i = 0; i < posAttr.count; i++) {
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            const h = data[row * cols + col] * HEIGHT_SCALE;
+            posAttr.setZ(i, h);
+        }
+
+        posAttr.needsUpdate = true;
+        geo.computeVertexNormals();
+
+        this.ground.geometry.dispose();
+        this.ground.geometry = geo;
+        this.ground.position.set(centerX, 0, centerZ);
+    }
+
+    // --- Ground texture (dynamic, changes with overlay) ---
+
+    private updateGroundTexture(scene: Scene) {
+        if (!this.ground) return;
+
+        // Determine grid dimensions from whichever source is available
+        const hm = scene.heightMap;
+        const sg = scene.soilGrid;
+        const bm = scene.basinMap;
+        const cols = hm?.cols ?? sg?.cols ?? 0;
+        const rows = hm?.rows ?? sg?.rows ?? 0;
+        if (cols === 0 || rows === 0) return;
+
+        // Reuse or create canvas texture
+        let canvas: HTMLCanvasElement;
+        if (this.groundTexture) {
+            canvas = this.groundTexture.image as HTMLCanvasElement;
+            if (canvas.width !== cols || canvas.height !== rows) {
+                canvas.width = cols;
+                canvas.height = rows;
+            }
+        } else {
+            canvas = document.createElement('canvas');
+            canvas.width = cols;
+            canvas.height = rows;
+        }
+
+        const ctx = canvas.getContext('2d')!;
+        const imageData = ctx.createImageData(cols, rows);
+        const overlay = this.currentOverlay;
+
+        for (let i = 0; i < cols * rows; i++) {
+            const px = i * 4;
+            let r: number, g: number, b: number;
+
+            if (overlay === 'elevation' && hm) {
+                const range = hm.maxHeight - hm.minHeight || 1;
+                const h = (hm.data[i] - hm.minHeight) / range;
+                r = Math.round(40 + h * 200);
+                g = Math.round(80 + h * 140);
+                b = Math.round(40 + h * 80);
+            } else if (overlay === 'basin' && bm) {
+                const v = bm.data[i];
+                r = Math.round(200 - v * 190);
+                g = Math.round(184 - v * 126);
+                b = Math.round(122 + v * 0);
+            } else if (overlay === 'water' && sg) {
+                const wl = sg.waterLevel[i];
+                const depth = Math.min(1, wl);
+                r = Math.round(200 * (1 - depth) + 10 * depth);
+                g = Math.round(184 * (1 - depth) + 74 * depth);
+                b = Math.round(122 * (1 - depth) + 160 * depth);
+            } else if (overlay && overlay !== 'elevation' && overlay !== 'basin' && overlay !== 'water' && sg) {
+                // Soil property overlay
+                const v = sg.layers[overlay as SoilProperty][i];
+                const c = SOIL_OVERLAY_COLORS[overlay as SoilProperty];
+                r = Math.round(c.r0 + v * (c.r1 - c.r0));
+                g = Math.round(c.g0 + v * (c.g1 - c.g0));
+                b = Math.round(c.b0 + v * (c.b1 - c.b0));
+            } else {
+                // Default: realistic terrain color from soil + elevation
+                // Blends humidity, minerals, and normalized elevation:
+                //   Dry + high elevation → grey rock
+                //   Humid + low elevation → lush green
+                //   Mineral-rich → brownish earth
+                //   Moderate → golden/tan grass
+                if (sg && hm) {
+                    const humidity = sg.layers.humidity[i];
+                    const minerals = sg.layers.minerals[i];
+                    const range = hm.maxHeight - hm.minHeight || 1;
+                    const elev = (hm.data[i] - hm.minHeight) / range; // [0..1]
+
+                    // Rocky mountain factor: high elevation + low humidity → grey rock
+                    const rockFactor = Math.max(0, elev - 0.45) * 2; // starts at elev 0.45
+                    // Lush green factor: high humidity
+                    const greenFactor = humidity;
+                    // Earth factor: minerals
+                    const earthFactor = minerals * 0.6;
+
+                    // Base grass color (golden tan)
+                    let br = 165, bg = 155, bb = 100;
+
+                    // Blend towards green (humid)
+                    br += Math.round((-120) * greenFactor);  // 165 → 45
+                    bg += Math.round((30) * greenFactor);     // 155 → 185
+                    bb += Math.round((-60) * greenFactor);    // 100 → 40
+
+                    // Blend towards brown earth (minerals)
+                    br += Math.round(15 * earthFactor);
+                    bg += Math.round((-20) * earthFactor);
+                    bb += Math.round((-15) * earthFactor);
+
+                    // Blend towards grey rock (high elevation)
+                    const rockR = 140, rockG = 135, rockB = 130;
+                    const rf = Math.min(1, rockFactor);
+                    br = Math.round(br * (1 - rf) + rockR * rf);
+                    bg = Math.round(bg * (1 - rf) + rockG * rf);
+                    bb = Math.round(bb * (1 - rf) + rockB * rf);
+
+                    r = Math.max(0, Math.min(255, br));
+                    g = Math.max(0, Math.min(255, bg));
+                    b = Math.max(0, Math.min(255, bb));
+                } else if (sg) {
+                    const h = sg.layers.humidity[i];
+                    r = Math.round(200 - h * 174);
+                    g = Math.round(184 - h * 62);
+                    b = Math.round(122 - h * 80);
+                } else {
+                    r = 58; g = 125; b = 68;
+                }
+            }
+
+            imageData.data[px + 0] = r;
+            imageData.data[px + 1] = g;
+            imageData.data[px + 2] = b;
+            imageData.data[px + 3] = 255;
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+
+        if (this.groundTexture) {
+            this.groundTexture.needsUpdate = true;
+        } else {
+            this.groundTexture = new THREE.CanvasTexture(canvas);
+            this.groundTexture.minFilter = THREE.LinearFilter;
+            this.groundTexture.magFilter = THREE.LinearFilter;
+            (this.ground.material as THREE.MeshLambertMaterial).dispose();
+            this.ground.material = new THREE.MeshLambertMaterial({ map: this.groundTexture });
+        }
+
+        // If no heightmap applied yet, also resize geometry to match grid
+        if (!this.groundHeightApplied && (sg || hm)) {
+            const ref = sg ?? hm!;
+            const worldW = (ref.cols - 1) * ref.cellSize * SCALE;
+            const worldH = (ref.rows - 1) * ref.cellSize * SCALE;
+            const centerX = (ref.originX + (ref.cols - 1) * ref.cellSize / 2) * SCALE;
+            const centerZ = (ref.originY + (ref.rows - 1) * ref.cellSize / 2) * SCALE;
+            this.ground.geometry.dispose();
+            this.ground.geometry = new THREE.PlaneGeometry(worldW, worldH);
+            this.ground.position.set(centerX, 0, centerZ);
+        }
+    }
+
+    // --- Water mesh (lakes) ---
+
+    private updateWaterMesh(scene: Scene) {
+        if (!this.threeScene) return;
+
+        // If lakes disabled or no soil grid, remove water mesh if present
+        if (!scene.lakesEnabled || !scene.soilGrid || !scene.heightMap) {
+            if (this.waterMesh) {
+                this.threeScene.remove(this.waterMesh);
+                this.disposeObject(this.waterMesh);
+                this.waterMesh = null;
+                this.waterGeometry = null;
+                if (this.waterTexture) this.waterTexture.dispose();
+                this.waterTexture = null;
+            }
+            return;
+        }
+
+        // Throttle updates (no need to recalc every frame)
+        this.waterUpdateTimer += this.clock.getDelta() * 1000;
+        if (this.waterMesh && this.waterUpdateTimer < ThreeRenderer.WATER_UPDATE_INTERVAL) return;
+        this.waterUpdateTimer = 0;
+
+        const sg = scene.soilGrid;
+        const hm = scene.heightMap;
+        const { cols, rows, cellSize, originX, originY, waterLevel } = sg;
+
+        // Check if any water exists at all
+        let hasWater = false;
+        for (let i = 0; i < cols * rows; i++) {
+            if (waterLevel[i] > 0.01) { hasWater = true; break; }
+        }
+
+        if (!hasWater) {
+            if (this.waterMesh) {
+                this.waterMesh.visible = false;
+            }
+            return;
+        }
+
+        // Create or reuse geometry — match ground grid: (cols-1) segments = cols vertices
+        if (!this.waterGeometry) {
+            this.waterGeometry = new THREE.PlaneGeometry(
+                (cols - 1) * cellSize * SCALE,
+                (rows - 1) * cellSize * SCALE,
+                cols - 1, rows - 1,
+            );
+            this.waterGeometry.rotateX(-Math.PI / 2);
+        }
+
+        // Update vertex heights: where there's water, raise to terrain + small offset
+        // Where there's no water, drop below terrain to hide
+        const posAttr = this.waterGeometry.getAttribute('position');
+        const WATER_OFFSET = 0.15; // small offset above terrain
+
+        for (let iy = 0; iy < rows; iy++) {
+            for (let ix = 0; ix < cols; ix++) {
+                const vIdx = iy * cols + ix;
+
+                // World position of this vertex (matches heightmap cell position)
+                const wx = originX + ix * cellSize;
+                const wy = originY + iy * cellSize;
+
+                const cellIdx = iy * cols + ix;
+                const wl = waterLevel[cellIdx];
+
+                const terrainH = getHeightAt(hm, wx, wy) * HEIGHT_SCALE;
+
+                if (wl > 0.01) {
+                    posAttr.setY(vIdx, terrainH + WATER_OFFSET);
+                } else {
+                    // Hide this vertex below terrain
+                    posAttr.setY(vIdx, terrainH - 2);
+                }
+            }
+        }
+        posAttr.needsUpdate = true;
+        this.waterGeometry.computeVertexNormals();
+
+        // Update alpha texture (per-cell alpha)
+        let waterCanvas: HTMLCanvasElement;
+        if (this.waterTexture) {
+            waterCanvas = this.waterTexture.image as HTMLCanvasElement;
+        } else {
+            waterCanvas = document.createElement('canvas');
+            waterCanvas.width = cols;
+            waterCanvas.height = rows;
+        }
+
+        const ctx = waterCanvas.getContext('2d')!;
+        const imageData = ctx.createImageData(cols, rows);
+
+        for (let i = 0; i < cols * rows; i++) {
+            const wl = waterLevel[i];
+            const px = i * 4;
+            const depth = Math.min(1, wl);
+            // Water color: shallow = light blue, deep = darker blue
+            imageData.data[px + 0] = Math.round(20 * (1 - depth) + 10 * depth);
+            imageData.data[px + 1] = Math.round(140 * (1 - depth) + 60 * depth);
+            imageData.data[px + 2] = Math.round(220 * (1 - depth) + 180 * depth);
+            imageData.data[px + 3] = wl > 0.01 ? Math.round(Math.min(200, wl * 220)) : 0;
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+
+        if (this.waterTexture) {
+            this.waterTexture.needsUpdate = true;
+        } else {
+            this.waterTexture = new THREE.CanvasTexture(waterCanvas);
+            this.waterTexture.minFilter = THREE.LinearFilter;
+            this.waterTexture.magFilter = THREE.LinearFilter;
+        }
+
+        // Create mesh if needed
+        if (!this.waterMesh) {
+            const waterMat = new THREE.MeshLambertMaterial({
+                map: this.waterTexture,
+                transparent: true,
+                depthWrite: false,
+                side: THREE.DoubleSide,
+            });
+            this.waterMesh = new THREE.Mesh(this.waterGeometry, waterMat);
+            const centerX = (originX + (cols - 1) * cellSize / 2) * SCALE;
+            const centerZ = (originY + (rows - 1) * cellSize / 2) * SCALE;
+            this.waterMesh.position.set(centerX, 0, centerZ);
+            this.threeScene.add(this.waterMesh);
+        }
+
+        this.waterMesh.visible = true;
+    }
+
     // --- Utility ---
 
     private disposeObject(obj: THREE.Object3D) {
@@ -788,6 +1350,95 @@ function drawTextToCanvas(ctx: CanvasRenderingContext2D, text: string, color: st
     // Text
     ctx.fillStyle = color;
     ctx.fillText(text, w / 2, h / 2);
+}
+
+// =============================================================
+//  PLANT MESHES
+// =============================================================
+
+function createPlantMesh(
+    plant: PlantEntity,
+    speciesId: string,
+    color: string,
+    matureColor: string,
+    maxSize: number,
+): THREE.Group {
+    const group = new THREE.Group();
+    const c = plant.growth > 0.6 ? new THREE.Color(matureColor) : new THREE.Color(color);
+    const sz = maxSize * SCALE;
+
+    if (plant.stage === 'seed') {
+        // Tiny brown sphere
+        const geo = new THREE.SphereGeometry(0.03, 6, 6);
+        const mat = new THREE.MeshLambertMaterial({ color: 0x8B7355 });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.y = 0.02;
+        group.add(mesh);
+        return group;
+    }
+
+    if (speciesId === 'oak' || speciesId === 'pine') {
+        // Trunk
+        const trunkH = sz * 0.8;
+        const trunkR = sz * 0.08;
+        const trunkGeo = new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6);
+        const trunkMat = new THREE.MeshLambertMaterial({ color: 0x6B4226 });
+        const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+        trunk.position.y = trunkH / 2;
+        group.add(trunk);
+
+        // Crown
+        if (speciesId === 'pine') {
+            // Cone
+            const crownH = sz * 1.2;
+            const crownR = sz * 0.45;
+            const crownGeo = new THREE.ConeGeometry(crownR, crownH, 8);
+            const crownMat = new THREE.MeshLambertMaterial({ color: c });
+            const crown = new THREE.Mesh(crownGeo, crownMat);
+            crown.position.y = trunkH + crownH * 0.35;
+            group.add(crown);
+        } else {
+            // Sphere
+            const crownR = sz * 0.55;
+            const crownGeo = new THREE.SphereGeometry(crownR, 8, 6);
+            const crownMat = new THREE.MeshLambertMaterial({ color: c });
+            const crown = new THREE.Mesh(crownGeo, crownMat);
+            crown.position.y = trunkH + crownR * 0.3;
+            group.add(crown);
+        }
+    } else if (speciesId === 'wheat') {
+        // Stalk
+        const stalkH = sz * 0.7;
+        const stalkGeo = new THREE.CylinderGeometry(0.01, 0.015, stalkH, 4);
+        const stalkMat = new THREE.MeshLambertMaterial({ color: 0x8B8B3A });
+        const stalk = new THREE.Mesh(stalkGeo, stalkMat);
+        stalk.position.y = stalkH / 2;
+        group.add(stalk);
+
+        // Grain head
+        const headGeo = new THREE.SphereGeometry(sz * 0.12, 6, 4);
+        headGeo.scale(0.6, 1.2, 0.6);
+        const headMat = new THREE.MeshLambertMaterial({ color: c });
+        const head = new THREE.Mesh(headGeo, headMat);
+        head.position.y = stalkH;
+        group.add(head);
+    } else {
+        // Default: wildflower — stem + sphere
+        const stemH = sz * 0.4;
+        const stemGeo = new THREE.CylinderGeometry(0.01, 0.015, stemH, 4);
+        const stemMat = new THREE.MeshLambertMaterial({ color: 0x4a7a4a });
+        const stem = new THREE.Mesh(stemGeo, stemMat);
+        stem.position.y = stemH / 2;
+        group.add(stem);
+
+        const petalGeo = new THREE.SphereGeometry(sz * 0.2, 8, 6);
+        const petalMat = new THREE.MeshLambertMaterial({ color: c });
+        const petal = new THREE.Mesh(petalGeo, petalMat);
+        petal.position.y = stemH + sz * 0.1;
+        group.add(petal);
+    }
+
+    return group;
 }
 
 // --- Register ---

@@ -3,19 +3,31 @@ import { useGameLoop } from '@/hooks/useGameLoop';
 
 import classNameModule from '@anthonyjeamme/classname';
 import styles from './Game.module.scss';
-import { processWorld } from './Game.world';
-import { processAI } from './Game.ai';
-import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, SECONDS_PER_HOUR, Scene, getCalendar, getLifeStage } from './Game.types';
-import { getItemDef } from './Game.registry';
-import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from './Game.terrain';
-import { generateEntityId } from './Game.ids';
-import { initFactions, updateFactionStats, checkFactionConflicts } from './Game.factions';
-import { processEvents } from './Game.events';
-import { GameRenderer, createRenderer, getAvailableRenderers } from './Game.renderer';
+import { processWorld } from '../World/simulation';
+import { processAI } from '../AI/brain';
+import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_HOUR, Scene, getCalendar, getLifeStage } from '../World/types';
+import { getItemDef } from '../Shared/registry';
+import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from '../World/terrain';
+import { generateEntityId } from '../Shared/ids';
+import { /* initFactions, */ updateFactionStats, checkFactionConflicts } from '../World/factions';
+import { processEvents } from '../World/events';
+import { createSoilGrid } from '../World/fertility';
+import { createHeightMap, createBasinMap, createDepressionMap } from '../World/heightmap';
+import { createWeatherState, WEATHER_LABELS, WEATHER_ICONS, WEATHER_TYPES } from '../World/weather';
+import type { WeatherType } from '../World/weather';
+import { GameRenderer, createRenderer, getAvailableRenderers, SoilOverlay } from '../Render/GameRenderer';
+import { SOIL_PROPERTIES, SoilProperty } from '../World/fertility';
+
+const SOIL_LAYER_LABELS: Record<SoilProperty, string> = {
+    humidity: 'Humidité',
+    minerals: 'Minéraux',
+    organicMatter: 'Mat. organique',
+    sunExposure: 'Ensoleillement',
+};
 
 // --- Register available renderers (side-effect imports) ---
-import './Game.renderer.canvas2d';
-import './Game.renderer.three';
+import '../Render/2DRender/Canvas2DRenderer';
+import '../Render/3DRender/ThreeRenderer';
 
 const className = classNameModule(styles);
 
@@ -147,7 +159,8 @@ function generateVillage(
             inventory: [],
             messages: [],
             knowledge: { relations: [], locations: [], npcs: [] },
-            ai: { state: 'idle', targetId: null, tickInterval: 0.1 + Math.random() * 0.05, tickAccumulator: 0, greetBubbleTimer: 0, restTimer: 0, tradeOffer: null, tradeWant: null, tradePhase: null, craftRecipeId: null, attackCooldown: 0 },
+            ai: { state: 'idle', targetId: null, tickInterval: 0.1 + Math.random() * 0.05, tickAccumulator: 0, greetBubbleTimer: 0, restTimer: 0, tradeOffer: null, tradeWant: null, tradePhase: null, craftRecipeId: null, attackCooldown: 0, sleepConsolidated: false },
+            actionHistory: [],
         };
         allEntities.push(npc);
         villageNpcs.push(npc);
@@ -272,20 +285,58 @@ function generateResourceCluster(
     }
 }
 
+function generateTestPlants(entities: Scene['entities']) {
+    // Single test plant at world center for development
+    const plant: PlantEntity = {
+        id: `plant-${generateEntityId()}`,
+        type: 'plant',
+        speciesId: 'oak',
+        position: { x: 0, y: 0 },
+        growth: 0,
+        health: 100,
+        age: 0,
+        stage: 'seed',
+        seedTimer: 0,
+    };
+    entities.push(plant);
+}
+
 function createInitialScene(): Scene {
     const entities: Scene['entities'] = [];
 
-    // Generate 3 villages with 6-8 NPCs each
-    for (let v = 0; v < VILLAGE_CENTERS.length; v++) {
-        const npcCount = 6 + Math.floor(Math.random() * 3); // 6-8
-        generateVillage(VILLAGE_CENTERS[v], npcCount, v, entities);
-        generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
-    }
+    // --- NPC generation disabled for flora development ---
+    // for (let v = 0; v < VILLAGE_CENTERS.length; v++) {
+    //     const npcCount = 6 + Math.floor(Math.random() * 3);
+    //     generateVillage(VILLAGE_CENTERS[v], npcCount, v, entities);
+    //     generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
+    // }
 
-    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR }; // start at 8:00
+    // Generate terrain
+    const WORLD_HALF = 1200;
+    const CELL_SIZE = 32;
+    const soilGrid = createSoilGrid(
+        -WORLD_HALF, -WORLD_HALF,
+        WORLD_HALF * 2, WORLD_HALF * 2,
+        CELL_SIZE,
+        42,
+    );
+    const heightMap = createHeightMap(
+        -WORLD_HALF, -WORLD_HALF,
+        WORLD_HALF * 2, WORLD_HALF * 2,
+        CELL_SIZE,
+        150,   // max elevation in world units (px)
+        77,    // different seed from soil
+    );
+    const basinMap = createBasinMap(heightMap);
+    const depressionMap = createDepressionMap(heightMap);
 
-    // Initialize factions
-    initFactions(scene, VILLAGE_CENTERS);
+    // Scatter test plants
+    generateTestPlants(entities);
+
+    const weather = createWeatherState();
+    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true };
+
+    // initFactions(scene, VILLAGE_CENTERS); // disabled while testing flora
 
     return scene;
 }
@@ -295,6 +346,8 @@ type UISnapshot = {
     npcs: NPCEntity[];
     corpses: CorpseEntity[];
     calendar: Calendar;
+    weatherType: import('../World/weather').WeatherType | null;
+    rainIntensity: number;
 };
 
 const INITIAL_SCENE = createInitialScene();
@@ -314,10 +367,17 @@ export const Game = () => {
     const [focusedNpcId, setFocusedNpcId] = useState<string | null>(null);
     const focusedNpcIdRef = useRef<string | null>(null);
     const [activeRendererId, setActiveRendererId] = useState('canvas2d');
+    const [soilOverlay, setSoilOverlay] = useState<SoilOverlay>(null);
+    const [weatherDropdown, setWeatherDropdown] = useState(false);
+    const [weatherOverride, setWeatherOverride] = useState<WeatherType | null>(null);
+    const [lakesEnabled, setLakesEnabled] = useState(true);
+    const [thirdPerson, setThirdPerson] = useState(false);
     const [ui, setUi] = useState<UISnapshot>(() => ({
         npcs: INITIAL_SCENE.entities.filter((e): e is NPCEntity => e.type === 'npc'),
         corpses: [],
         calendar: getCalendar(INITIAL_SCENE.time),
+        weatherType: INITIAL_SCENE.weather?.current ?? null,
+        rainIntensity: 0,
     }));
 
     // Sync state → refs for game loop access (outside of render)
@@ -416,14 +476,16 @@ export const Game = () => {
                 npcs: entities.filter((e): e is NPCEntity => e.type === 'npc'),
                 corpses: entities.filter((e): e is CorpseEntity => e.type === 'corpse'),
                 calendar: getCalendar(sceneRef.current.time),
+                weatherType: sceneRef.current.weather?.current ?? null,
+                rainIntensity: sceneRef.current.weather?.rainIntensity ?? 0,
             });
         }
 
         // Render via the pluggable renderer
-        rendererRef.current?.render(sceneRef.current, cameraRef.current, highlightRef.current);
+        rendererRef.current?.render(sceneRef.current, cameraRef.current, highlightRef.current, soilOverlay);
     }, true);
 
-    const { npcs, corpses, calendar } = ui;
+    const { npcs, corpses, calendar, weatherType, rainIntensity } = ui;
 
     const focusedNpc = focusedNpcId
         ? npcs.find((n) => n.id === focusedNpcId) ?? null
@@ -485,7 +547,7 @@ export const Game = () => {
                             {...className('FocusPanelClose')}
                             onClick={() => setFocusedNpcId(null)}
                         >
-                            \u2715
+                            X
                         </button>
                     </div>
                     <NpcDetailPanel npc={focusedNpc} allNpcs={npcs} onHighlight={(h) => { highlightRef.current = h; }} />
@@ -496,10 +558,63 @@ export const Game = () => {
                 <span {...className('StatItem', 'CalendarInfo')}>
                     An {calendar.year} — {calendar.season}, Jour {calendar.dayOfSeason} — {calendar.hour}h ({calendar.timeLabel})
                 </span>
+                {weatherType && (
+                    <div {...className('WeatherPicker')}>
+                        <div
+                            {...className('WeatherCurrent')}
+                            onClick={() => setWeatherDropdown((v) => !v)}
+                        >
+                            <span {...className('WeatherIcon')}>{WEATHER_ICONS[weatherType]}</span>
+                            {WEATHER_LABELS[weatherType]}
+                            {weatherOverride !== null && <span {...className('RainBadge')}>forcé</span>}
+                            {rainIntensity > 0 && <span {...className('RainBadge')}>{Math.round(rainIntensity * 100)}%</span>}
+                            <span style={{ opacity: 0.4, fontSize: 9 }}>▼</span>
+                        </div>
+                        {weatherDropdown && (
+                            <div {...className('WeatherDropdown')}>
+                                <button
+                                    {...className('WeatherOption', { active: weatherOverride === null })}
+                                    onClick={() => {
+                                        setWeatherOverride(null);
+                                        if (sceneRef.current.weather) sceneRef.current.weather.override = null;
+                                        setWeatherDropdown(false);
+                                    }}
+                                >
+                                    🔄 Auto
+                                </button>
+                                {WEATHER_TYPES.map((w: WeatherType) => (
+                                    <button
+                                        key={w}
+                                        {...className('WeatherOption', { active: weatherOverride === w })}
+                                        onClick={() => {
+                                            setWeatherOverride(w);
+                                            if (sceneRef.current.weather) sceneRef.current.weather.override = w;
+                                            setWeatherDropdown(false);
+                                        }}
+                                    >
+                                        <span {...className('WeatherIcon')}>{WEATHER_ICONS[w]}</span>
+                                        {WEATHER_LABELS[w]}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+                <button
+                    {...className('LakeToggle', { active: lakesEnabled })}
+                    onClick={() => {
+                        const next = !lakesEnabled;
+                        setLakesEnabled(next);
+                        sceneRef.current.lakesEnabled = next;
+                    }}
+                    title={lakesEnabled ? 'Désactiver les lacs' : 'Activer les lacs'}
+                >
+                    💧 Lacs {lakesEnabled ? 'ON' : 'OFF'}
+                </button>
                 <span {...className('StatItem')}>Vivants: {npcs.length}</span>
                 <span {...className('StatItem')}>Morts: {corpses.length}</span>
                 <div {...className('SpeedControls')}>
-                    {[0.25, 0.5, 1, 5, 10, 20].map((s) => (
+                    {[0.25, 0.5, 1, 5, 10, 20, 50, 100].map((s) => (
                         <button
                             key={s}
                             {...className('SpeedBtn', { active: speed === s })}
@@ -520,6 +635,7 @@ export const Game = () => {
                             const idx = availableRenderers.indexOf(activeRendererId);
                             const next = availableRenderers[(idx + 1) % availableRenderers.length];
                             setActiveRendererId(next);
+                            setThirdPerson(false); // reset on renderer switch
                         }}
                     >
                         {activeRendererId === 'three3d' ? '🎮 3D' : '🗺️ 2D'}
@@ -527,8 +643,59 @@ export const Game = () => {
                             → {activeRendererId === 'three3d' ? '2D' : '3D'}
                         </span>
                     </button>
+                    {activeRendererId === 'three3d' && (
+                        <button
+                            {...className('RendererToggleBtn', { active: thirdPerson })}
+                            onClick={() => {
+                                const r = rendererRef.current;
+                                if (r?.setThirdPerson) {
+                                    const next = r.setThirdPerson(!thirdPerson);
+                                    setThirdPerson(next);
+                                }
+                            }}
+                        >
+                            🏃 {thirdPerson ? '3P ON' : '3P OFF'}
+                        </button>
+                    )}
                 </div>
             )}
+
+            {/* Soil layer picker — bottom left */}
+            <div {...className('SoilLayerPicker')}>
+                <button
+                    {...className('SoilLayerBtn', { active: soilOverlay === null })}
+                    onClick={() => setSoilOverlay(null)}
+                >
+                    Aucun
+                </button>
+                {SOIL_PROPERTIES.map((prop) => (
+                    <button
+                        key={prop}
+                        {...className('SoilLayerBtn', { active: soilOverlay === prop })}
+                        onClick={() => setSoilOverlay(soilOverlay === prop ? null : prop)}
+                    >
+                        {SOIL_LAYER_LABELS[prop]}
+                    </button>
+                ))}
+                <button
+                    {...className('SoilLayerBtn', { active: soilOverlay === 'elevation' })}
+                    onClick={() => setSoilOverlay(soilOverlay === 'elevation' ? null : 'elevation')}
+                >
+                    Élévation
+                </button>
+                <button
+                    {...className('SoilLayerBtn', { active: soilOverlay === 'basin' })}
+                    onClick={() => setSoilOverlay(soilOverlay === 'basin' ? null : 'basin')}
+                >
+                    Bassins
+                </button>
+                <button
+                    {...className('SoilLayerBtn', { active: soilOverlay === 'water' })}
+                    onClick={() => setSoilOverlay(soilOverlay === 'water' ? null : 'water')}
+                >
+                    💧 Eau
+                </button>
+            </div>
 
             <div {...className('InventoryPanel')}>
                 {npcs.map((npc) => {
@@ -763,6 +930,23 @@ function NpcDetailPanel({ npc, allNpcs, onHighlight }: {
                             <span {...cn('AffinityValue')}>{(zone.confidence * 100).toFixed(0)}</span>
                         </div>
                     ))
+                )}
+            </div>
+
+            {/* Action history */}
+            <div {...cn('DetailSection')}>
+                <div {...cn('DetailSectionTitle')}>Historique ({npc.actionHistory.length})</div>
+                {npc.actionHistory.length === 0 ? (
+                    <span {...cn('DetailEmpty')}>aucune action</span>
+                ) : (
+                    <div {...cn('HistoryList')}>
+                        {npc.actionHistory.map((entry, i) => (
+                            <div key={i} {...cn('HistoryRow', { latest: i === 0 })}>
+                                <span {...cn('HistoryIcon')}>{entry.icon}</span>
+                                <span {...cn('HistoryText')}>{entry.action}</span>
+                            </div>
+                        ))}
+                    </div>
                 )}
             </div>
         </div>

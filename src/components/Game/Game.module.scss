@@ -29,6 +29,7 @@
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  align-items: center;
   gap: 16px;
   background: rgba(255, 255, 255, 0.08);
   backdrop-filter: blur(8px);
@@ -44,6 +45,119 @@
 
 .StatItem {
   opacity: 0.7;
+  display: flex;
+  align-items: center;
+}
+
+.WeatherPicker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 1;
+  cursor: pointer;
+  user-select: none;
+}
+
+.WeatherCurrent {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  transition: background 0.15s ease;
+  line-height: 1;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.15);
+  }
+}
+
+.WeatherIcon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.WeatherDropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: rgba(10, 10, 20, 0.9);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  padding: 4px;
+  min-width: 130px;
+  z-index: 30;
+}
+
+.WeatherOption {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  font-family: monospace;
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+  line-height: 1;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #fff;
+  }
+
+  &.active {
+    background: rgba(60, 120, 200, 0.3);
+    color: #fff;
+    font-weight: 600;
+  }
+}
+
+.RainBadge {
+  background: rgba(50, 130, 220, 0.4);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #8ad;
+  margin-left: 2px;
+  line-height: 1;
+}
+
+.LakeToggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #aaa;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  margin-left: 6px;
+
+  &:hover {
+    background: rgba(60, 140, 220, 0.2);
+  }
+
+  &.active {
+    background: rgba(40, 120, 200, 0.3);
+    color: #8cf;
+    border-color: rgba(80, 160, 240, 0.4);
+  }
 }
 
 .SpeedControls {
@@ -467,6 +581,9 @@
   left: 50%;
   transform: translateX(-50%);
   z-index: 20;
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 .RendererToggleBtn {
@@ -497,6 +614,11 @@
   &:active {
     transform: scale(0.97);
   }
+
+  &.active {
+    background: rgba(40, 100, 200, 0.6);
+    border-color: rgba(100, 180, 255, 0.5);
+  }
 }
 
 .RendererToggleHint {
@@ -514,4 +636,88 @@
   background: rgba(255, 255, 255, 0.08);
   padding: 1px 5px;
   border-radius: 3px;
+}
+
+// --- Action history ---
+
+.HistoryList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.HistoryRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+
+  &:hover {
+    opacity: 0.8;
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  &.latest {
+    opacity: 0.9;
+    font-weight: 600;
+  }
+}
+
+.HistoryIcon {
+  font-size: 12px;
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+
+.HistoryText {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+// --- Soil layer picker ---
+
+.SoilLayerPicker {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.SoilLayerBtn {
+  background: rgba(10, 10, 20, 0.65);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.6);
+  font-family: monospace;
+  font-size: 11px;
+  padding: 5px 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+
+  &:hover {
+    background: rgba(30, 30, 50, 0.8);
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  &.active {
+    background: rgba(60, 120, 200, 0.35);
+    border-color: rgba(100, 160, 255, 0.5);
+    color: #fff;
+    font-weight: 600;
+  }
 }

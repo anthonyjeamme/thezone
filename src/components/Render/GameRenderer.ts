@@ -3,8 +3,12 @@
 //  Any renderer (Canvas2D, WebGL, Three.js, etc.) implements this.
 // =============================================================
 
-import { Camera, Highlight, Scene } from './Game.types';
-import { Vector2D } from './Game.vector';
+import { Camera, Highlight, Scene } from '../World/types';
+import { Vector2D } from '../Shared/vector';
+import type { SoilProperty } from '../World/fertility';
+
+/** Which layer to render as overlay, or null for none */
+export type SoilOverlay = SoilProperty | 'elevation' | 'basin' | 'water' | null;
 
 /**
  * Abstract renderer interface.
@@ -27,7 +31,7 @@ export interface GameRenderer {
      * Render one frame of the scene.
      * Called every frame from the game loop.
      */
-    render(scene: Scene, camera: Camera, highlight: Highlight): void;
+    render(scene: Scene, camera: Camera, highlight: Highlight, soilOverlay?: SoilOverlay): void;
 
     /**
      * Handle container resize. Called when the window/container size changes.
@@ -51,6 +55,15 @@ export interface GameRenderer {
      * Needed for mouse interactions (click to select NPC, etc.)
      */
     screenToWorld(screenX: number, screenY: number, camera: Camera): Vector2D;
+
+    /**
+     * Toggle third-person mode (optional — only 3D renderers support this).
+     * Returns the new state.
+     */
+    setThirdPerson?(enabled: boolean): boolean;
+
+    /** Whether third-person mode is active. */
+    isThirdPerson?(): boolean;
 }
 
 // =============================================================

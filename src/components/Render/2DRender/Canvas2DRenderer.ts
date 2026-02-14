@@ -3,10 +3,13 @@
 //  This is the original top-down 2D renderer, now pluggable.
 // =============================================================
 
-import { GameRenderer, registerRenderer } from './Game.renderer';
-import { BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, Highlight, LifeStage, NPCEntity, ResourceEntity, Scene, StockEntity, getCalendar, getLifeStage } from './Game.types';
-import { Vector2D } from './Game.vector';
-import { GESTATION_DURATION } from './Game.reproduction';
+import { GameRenderer, registerRenderer, SoilOverlay } from '../GameRenderer';
+import { BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, Highlight, LifeStage, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity, getCalendar, getLifeStage } from '../../World/types';
+import { getSpecies } from '../../World/flora';
+import { Vector2D } from '../../Shared/vector';
+import { GESTATION_DURATION } from '../../World/reproduction';
+import type { SoilGrid } from '../../World/fertility';
+import type { HeightMap, BasinMap } from '../../World/heightmap';
 
 // --- Constants ---
 
@@ -43,7 +46,7 @@ class Canvas2DRenderer implements GameRenderer {
         this.resize(rect.width, rect.height);
     }
 
-    render(scene: Scene, camera: Camera, highlight: Highlight): void {
+    render(scene: Scene, camera: Camera, highlight: Highlight, soilOverlay?: SoilOverlay): void {
         const ctx = this.ctx;
         if (!ctx || !this.canvas) return;
 
@@ -51,6 +54,22 @@ class Canvas2DRenderer implements GameRenderer {
         ctx.save();
         ctx.translate(this.canvas.width / 2, this.canvas.height / 2);
         ctx.translate(camera.position.x, camera.position.y);
+
+        // Render overlay (background layer)
+        if (soilOverlay === 'water' && scene.soilGrid) {
+            renderWaterOverlay(ctx, scene.soilGrid, camera, this.canvas.width, this.canvas.height);
+        } else if (soilOverlay === 'elevation' && scene.heightMap) {
+            renderHeightGrid(ctx, scene.heightMap, camera, this.canvas.width, this.canvas.height);
+        } else if (soilOverlay === 'basin' && scene.basinMap) {
+            renderBasinGrid(ctx, scene.basinMap, camera, this.canvas.width, this.canvas.height);
+        } else if (scene.soilGrid && soilOverlay && soilOverlay !== 'elevation' && soilOverlay !== 'basin' && soilOverlay !== 'water') {
+            renderSoilGrid(ctx, scene.soilGrid, soilOverlay, camera, this.canvas.width, this.canvas.height);
+        }
+
+        // Render water (lakes) over terrain
+        if (scene.lakesEnabled && scene.soilGrid && soilOverlay !== 'water') {
+            renderWaterLayer(ctx, scene.soilGrid, camera, this.canvas.width, this.canvas.height);
+        }
 
         // Render layers in order
         scene.entities.forEach((entity) => {
@@ -64,6 +83,9 @@ class Canvas2DRenderer implements GameRenderer {
         });
         scene.entities.forEach((entity) => {
             if (entity.type === 'stock') renderStock(ctx, entity);
+        });
+        scene.entities.forEach((entity) => {
+            if (entity.type === 'plant') renderPlant(ctx, entity);
         });
         scene.entities.forEach((entity) => {
             if (entity.type === 'resource') renderResource(ctx, entity);
@@ -436,4 +458,355 @@ function renderFertileZone(ctx: CanvasRenderingContext2D, entity: FertileZoneEnt
     ctx.setLineDash([]);
 
     ctx.globalAlpha = 1;
+}
+
+// --- Plant rendering ---
+
+function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
+    const species = getSpecies(plant.speciesId);
+    if (!species) return;
+
+    const { x, y } = plant.position;
+    const size = species.maxSize * Math.max(0.15, plant.growth);
+
+    // Color shifts with growth and health
+    const baseColor = plant.growth > 0.6 ? species.matureColor : species.color;
+    const color = plant.stage === 'dead' ? '#6B5B3A' : baseColor;
+
+    ctx.save();
+
+    // Fade out when dying
+    if (plant.health < 30 && plant.health > 0) {
+        ctx.globalAlpha = 0.4 + (plant.health / 30) * 0.6;
+    } else if (plant.stage === 'dead') {
+        ctx.globalAlpha = Math.max(0.1, 1 + plant.health / 50); // health goes negative after death
+    }
+
+    if (plant.stage === 'seed') {
+        // Tiny dot
+        ctx.fillStyle = '#8B7355';
+        ctx.beginPath();
+        ctx.arc(x, y, 2, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (plant.stage === 'sprout') {
+        // Small green stem
+        ctx.strokeStyle = '#5a9a3a';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y + 3);
+        ctx.lineTo(x, y - 3);
+        ctx.stroke();
+        // Tiny leaf
+        ctx.fillStyle = '#6abf4a';
+        ctx.beginPath();
+        ctx.ellipse(x + 2, y - 3, 2, 1.2, 0.5, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (species.id === 'oak' || species.id === 'pine') {
+        // Tree: trunk + crown
+        const trunkH = size * 0.6;
+        const trunkW = size * 0.25;
+        ctx.fillStyle = '#6B4226';
+        ctx.fillRect(x - trunkW / 2, y - trunkH / 2, trunkW, trunkH);
+
+        // Crown
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        if (species.id === 'pine') {
+            // Triangle for pine
+            ctx.moveTo(x, y - size);
+            ctx.lineTo(x - size * 0.7, y + size * 0.2);
+            ctx.lineTo(x + size * 0.7, y + size * 0.2);
+            ctx.closePath();
+        } else {
+            // Circle for oak
+            ctx.save()
+            ctx.translate(0, -size * 0.3);
+            ctx.arc(x, y - size * 0.3, size * 0.75, 0, Math.PI * 2);
+            ctx.restore();
+        }
+        ctx.fill();
+    } else if (species.id === 'wheat') {
+        // Wheat stalk
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y + size * 0.5);
+        ctx.lineTo(x, y - size * 0.5);
+        ctx.stroke();
+        // Grain head
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.ellipse(x, y - size * 0.5, size * 0.3, size * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+    } else {
+        // Default: flower / small plant — colored circle
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.arc(x, y, size * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        // Center dot
+        ctx.fillStyle = '#fff';
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        ctx.arc(x, y, size * 0.2, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    ctx.restore();
+}
+
+// --- Soil grid rendering ---
+
+import type { SoilProperty } from '../../World/fertility';
+
+/** Color palettes per soil property: low → high */
+const SOIL_COLORS: Record<SoilProperty, { r0: number; g0: number; b0: number; r1: number; g1: number; b1: number }> = {
+    humidity:      { r0: 200, g0: 184, b0: 122, r1: 26, g1: 122, b1: 180 },  // sand → blue
+    minerals:      { r0: 180, g0: 170, b0: 150, r1: 160, g1: 100, b1: 30 },  // grey → orange-brown
+    organicMatter: { r0: 200, g0: 190, b0: 170, r1: 40, g1: 30, b1: 10 },    // pale → dark earth
+    sunExposure:   { r0: 60, g0: 60, b0: 80, r1: 255, g1: 240, b1: 140 },    // shadow → bright yellow
+};
+
+function soilColor(value: number, prop: SoilProperty): string {
+    const c = SOIL_COLORS[prop];
+    const r = Math.round(c.r0 + value * (c.r1 - c.r0));
+    const g = Math.round(c.g0 + value * (c.g1 - c.g0));
+    const b = Math.round(c.b0 + value * (c.b1 - c.b0));
+    return `rgb(${r},${g},${b})`;
+}
+
+function renderSoilGrid(
+    ctx: CanvasRenderingContext2D,
+    grid: SoilGrid,
+    prop: SoilProperty,
+    camera: Camera,
+    canvasWidth: number,
+    canvasHeight: number,
+) {
+    const dpr = window.devicePixelRatio || 1;
+    const viewW = canvasWidth / dpr;
+    const viewH = canvasHeight / dpr;
+
+    const worldLeft = -camera.position.x - viewW / 2;
+    const worldTop = -camera.position.y - viewH / 2;
+    const worldRight = worldLeft + viewW;
+    const worldBottom = worldTop + viewH;
+
+    const colStart = Math.max(0, Math.floor((worldLeft - grid.originX) / grid.cellSize));
+    const colEnd = Math.min(grid.cols, Math.ceil((worldRight - grid.originX) / grid.cellSize));
+    const rowStart = Math.max(0, Math.floor((worldTop - grid.originY) / grid.cellSize));
+    const rowEnd = Math.min(grid.rows, Math.ceil((worldBottom - grid.originY) / grid.cellSize));
+
+    const cs = grid.cellSize;
+    const layer = grid.layers[prop];
+
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+
+    for (let row = rowStart; row < rowEnd; row++) {
+        for (let col = colStart; col < colEnd; col++) {
+            const idx = row * grid.cols + col;
+            const wx = grid.originX + col * cs;
+            const wy = grid.originY + row * cs;
+
+            ctx.fillStyle = soilColor(layer[idx], prop);
+            ctx.fillRect(wx, wy, cs, cs);
+        }
+    }
+
+    ctx.restore();
+}
+
+function renderHeightGrid(
+    ctx: CanvasRenderingContext2D,
+    map: HeightMap,
+    camera: Camera,
+    canvasWidth: number,
+    canvasHeight: number,
+) {
+    const dpr = window.devicePixelRatio || 1;
+    const viewW = canvasWidth / dpr;
+    const viewH = canvasHeight / dpr;
+
+    const worldLeft = -camera.position.x - viewW / 2;
+    const worldTop = -camera.position.y - viewH / 2;
+    const worldRight = worldLeft + viewW;
+    const worldBottom = worldTop + viewH;
+
+    const colStart = Math.max(0, Math.floor((worldLeft - map.originX) / map.cellSize));
+    const colEnd = Math.min(map.cols, Math.ceil((worldRight - map.originX) / map.cellSize));
+    const rowStart = Math.max(0, Math.floor((worldTop - map.originY) / map.cellSize));
+    const rowEnd = Math.min(map.rows, Math.ceil((worldBottom - map.originY) / map.cellSize));
+
+    const cs = map.cellSize;
+    const range = map.maxHeight - map.minHeight || 1;
+
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+
+    for (let row = rowStart; row < rowEnd; row++) {
+        for (let col = colStart; col < colEnd; col++) {
+            const idx = row * map.cols + col;
+            const h = (map.data[idx] - map.minHeight) / range; // [0..1]
+
+            // Low = dark green/blue, high = bright tan/white
+            const r = Math.round(40 + h * 200);
+            const g = Math.round(80 + h * 140);
+            const b = Math.round(40 + h * 80);
+
+            const wx = map.originX + col * cs;
+            const wy = map.originY + row * cs;
+
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(wx, wy, cs, cs);
+        }
+    }
+
+    ctx.restore();
+}
+
+function renderBasinGrid(
+    ctx: CanvasRenderingContext2D,
+    map: BasinMap,
+    camera: Camera,
+    canvasWidth: number,
+    canvasHeight: number,
+) {
+    const dpr = window.devicePixelRatio || 1;
+    const viewW = canvasWidth / dpr;
+    const viewH = canvasHeight / dpr;
+
+    const worldLeft = -camera.position.x - viewW / 2;
+    const worldTop = -camera.position.y - viewH / 2;
+    const worldRight = worldLeft + viewW;
+    const worldBottom = worldTop + viewH;
+
+    const colStart = Math.max(0, Math.floor((worldLeft - map.originX) / map.cellSize));
+    const colEnd = Math.min(map.cols, Math.ceil((worldRight - map.originX) / map.cellSize));
+    const rowStart = Math.max(0, Math.floor((worldTop - map.originY) / map.cellSize));
+    const rowEnd = Math.min(map.rows, Math.ceil((worldBottom - map.originY) / map.cellSize));
+
+    const cs = map.cellSize;
+
+    ctx.save();
+    ctx.globalAlpha = 0.6;
+
+    for (let row = rowStart; row < rowEnd; row++) {
+        for (let col = colStart; col < colEnd; col++) {
+            const idx = row * map.cols + col;
+            const v = map.data[idx]; // [0..1] — 0 = ridge, 1 = deep basin
+
+            // Dry sand (#c8b87a) → Deep blue (#0a3a7a)
+            const r = Math.round(200 - v * 190);
+            const g = Math.round(184 - v * 126);
+            const b = Math.round(122 + v * 0);
+
+            const wx = map.originX + col * cs;
+            const wy = map.originY + row * cs;
+
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(wx, wy, cs, cs);
+        }
+    }
+
+    ctx.restore();
+}
+
+// =============================================================
+//  Water layer (semi-transparent blue over flooded cells)
+// =============================================================
+
+function renderWaterLayer(
+    ctx: CanvasRenderingContext2D,
+    soilGrid: SoilGrid,
+    camera: Camera,
+    screenW: number,
+    screenH: number,
+) {
+    const { cols, rows, cellSize, originX, originY, waterLevel } = soilGrid;
+
+    ctx.save();
+
+    // Culling bounds
+    const worldLeft = -camera.position.x - screenW / 2;
+    const worldTop = -camera.position.y - screenH / 2;
+    const worldRight = worldLeft + screenW;
+    const worldBottom = worldTop + screenH;
+
+    const c0 = Math.max(0, Math.floor((worldLeft - originX) / cellSize));
+    const c1 = Math.min(cols - 1, Math.ceil((worldRight - originX) / cellSize));
+    const r0 = Math.max(0, Math.floor((worldTop - originY) / cellSize));
+    const r1 = Math.min(rows - 1, Math.ceil((worldBottom - originY) / cellSize));
+
+    for (let row = r0; row <= r1; row++) {
+        for (let col = c0; col <= c1; col++) {
+            const idx = row * cols + col;
+            const wl = waterLevel[idx];
+            if (wl <= 0.01) continue; // skip dry cells
+
+            const wx = originX + col * cellSize;
+            const wy = originY + row * cellSize;
+
+            const alpha = Math.min(0.7, wl * 0.8);
+            const depth = Math.min(1, wl);
+            // Shallow = light cyan, Deep = dark blue
+            const r = Math.round(20 * (1 - depth) + 10 * depth);
+            const g = Math.round(140 * (1 - depth) + 40 * depth);
+            const b = Math.round(200 * (1 - depth) + 160 * depth);
+
+            ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+            ctx.fillRect(wx, wy, cellSize, cellSize);
+        }
+    }
+
+    ctx.restore();
+}
+
+// =============================================================
+//  Water overlay (opaque view for data visualization)
+// =============================================================
+
+function renderWaterOverlay(
+    ctx: CanvasRenderingContext2D,
+    soilGrid: SoilGrid,
+    camera: Camera,
+    screenW: number,
+    screenH: number,
+) {
+    const { cols, rows, cellSize, originX, originY, waterLevel } = soilGrid;
+
+    ctx.save();
+
+    const worldLeft = -camera.position.x - screenW / 2;
+    const worldTop = -camera.position.y - screenH / 2;
+    const worldRight = worldLeft + screenW;
+    const worldBottom = worldTop + screenH;
+
+    const c0 = Math.max(0, Math.floor((worldLeft - originX) / cellSize));
+    const c1 = Math.min(cols - 1, Math.ceil((worldRight - originX) / cellSize));
+    const r0 = Math.max(0, Math.floor((worldTop - originY) / cellSize));
+    const r1 = Math.min(rows - 1, Math.ceil((worldBottom - originY) / cellSize));
+
+    for (let row = r0; row <= r1; row++) {
+        for (let col = c0; col <= c1; col++) {
+            const idx = row * cols + col;
+            const wl = waterLevel[idx];
+
+            const wx = originX + col * cellSize;
+            const wy = originY + row * cellSize;
+
+            // Dry = tan (#c8b87a), Wet = deep blue (#0a4aa0)
+            const depth = Math.min(1, wl);
+            const r = Math.round(200 * (1 - depth) + 10 * depth);
+            const g = Math.round(184 * (1 - depth) + 74 * depth);
+            const b = Math.round(122 * (1 - depth) + 160 * depth);
+
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(wx, wy, cellSize, cellSize);
+        }
+    }
+
+    ctx.restore();
 }

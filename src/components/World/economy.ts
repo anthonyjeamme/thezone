@@ -2,10 +2,10 @@
 //  ECONOMY — Pricing, market, and monetary trade
 // =============================================================
 
-import { BuildingEntity, NPCEntity, Scene, StockEntity, WorldAPI, countItem, addItem, removeItem } from './Game.types';
-import { getItemDef, getAllItems, ItemDef } from './Game.registry';
-import { distance } from './Game.vector';
-import { logger } from './Game.logger';
+import { BuildingEntity, NPCEntity, Scene, StockEntity, WorldAPI, countItem, addItem, removeItem } from './types';
+import { getItemDef, getAllItems, ItemDef } from '../Shared/registry';
+import { distance } from '../Shared/vector';
+import { logger } from '../Shared/logger';
 
 // --- Price calculation ---
 

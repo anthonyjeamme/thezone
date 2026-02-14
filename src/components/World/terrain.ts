@@ -1,8 +1,8 @@
-import { BuildingEntity } from './Game.types';
+import { BuildingEntity } from './types';
 
 /** @deprecated Use BuildingEntity */
 type CabinEntity = BuildingEntity;
-import { Vector2D, distance } from './Game.vector';
+import { Vector2D, distance } from '../Shared/vector';
 
 // --- Cabin plot generation ---
 

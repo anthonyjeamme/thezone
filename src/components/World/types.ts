@@ -1,9 +1,9 @@
-import { Vector2D } from './Game.vector';
-import { ItemStack, getItemDef, addItem, removeItem, countItem, hasItems } from './Game.registry';
+import { Vector2D } from '../Shared/vector';
+import { ItemStack, getItemDef, addItem, removeItem, countItem, hasItems } from '../Shared/registry';
 
 // Re-export for convenience
-export type { ItemStack } from './Game.registry';
-export { getItemDef, addItem, removeItem, countItem, hasItems } from './Game.registry';
+export type { ItemStack } from '../Shared/registry';
+export { getItemDef, addItem, removeItem, countItem, hasItems } from '../Shared/registry';
 
 // --- Camera ---
 
@@ -226,9 +226,17 @@ export const CONCEPTION_CHANCE = 0.3;
 
 // --- NPC: Messages (inter-NPC communication) ---
 
+/** Shared zone info carried inside a greeting message */
+export type SharedZoneInfo = {
+    position: Vector2D;
+    resourceType: ResourceType;
+    confidence: number;
+    source: 'firsthand' | 'hearsay';
+};
+
 export type NPCMessage =
     | { type: 'court_request'; fromId: string }
-    | { type: 'greeting'; fromId: string }
+    | { type: 'greeting'; fromId: string; sharedZones?: SharedZoneInfo[] }
     | { type: 'trade_offer'; fromId: string; offer: string; want: string };
 
 // --- NPC: Actions ---
@@ -286,6 +294,8 @@ export type NPCAIState = {
     craftRecipeId: string | null;  // recipe being crafted
     // Combat state
     attackCooldown: number;       // seconds until next attack
+    // Sleep consolidation
+    sleepConsolidated: boolean;   // true once knowledge is consolidated during this sleep
 };
 
 // --- NPC: Movement ---
@@ -338,7 +348,29 @@ export type NPCEntity = {
 
     // AI runtime
     ai: NPCAIState;
+
+    // Action history (recent first, capped)
+    actionHistory: NPCActionLog[];
 };
+
+// --- Action log entry ---
+
+export type NPCActionLog = {
+    time: number;       // scene time when this happened
+    action: string;     // human-readable label, e.g. "gathering wood", "trading with Alaric"
+    icon: string;       // emoji/symbol for the UI
+};
+
+const MAX_ACTION_HISTORY = 20;
+
+/** Push an entry to the NPC action log (most recent first, capped). Skips consecutive duplicates. */
+export function logAction(npc: NPCEntity, sceneTime: number, action: string, icon: string) {
+    if (npc.actionHistory.length > 0 && npc.actionHistory[0].action === action) return;
+    npc.actionHistory.unshift({ time: sceneTime, action, icon });
+    if (npc.actionHistory.length > MAX_ACTION_HISTORY) {
+        npc.actionHistory.length = MAX_ACTION_HISTORY;
+    }
+}
 
 // --- Helper: partnership check ---
 
@@ -417,13 +449,35 @@ export type FertileZoneEntity = {
     color: string;
 };
 
+// --- Plant Entity ---
+
+export type PlantGrowthStage = 'seed' | 'sprout' | 'growing' | 'mature' | 'dead';
+
+export type PlantEntity = {
+    id: string;
+    type: 'plant';
+    speciesId: string;        // references a PlantSpecies.id
+    position: Vector2D;
+    growth: number;           // 0..1 — progression toward maturity
+    health: number;           // 0..100
+    age: number;              // sim-seconds alive
+    stage: PlantGrowthStage;
+    seedTimer: number;        // sim-seconds until next seed dispersal
+};
+
 // --- Scene ---
 
-export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity;
+export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity | PlantEntity;
 
 export type Scene = {
     entities: SceneEntity[];
     time: number;   // elapsed sim-seconds (used for calendar)
+    soilGrid?: import('./fertility').SoilGrid;     // multi-property soil map
+    heightMap?: import('./heightmap').HeightMap;    // terrain elevation
+    basinMap?: import('./heightmap').BasinMap;     // flow accumulation (derived from heightmap)
+    depressionMap?: import('./heightmap').DepressionMap; // topographic depressions for lake sim
+    weather?: import('./weather').WeatherState;    // current weather conditions
+    lakesEnabled: boolean;                          // toggle lakes feature on/off
 };
 
 // --- World API ---
@@ -432,6 +486,22 @@ export type EntityInfo = {
     id: string;
     position: Vector2D;
     distance: number;
+};
+
+/** Observable NPC info — physical observations, not raw stats */
+export type NPCInfo = EntityInfo & {
+    name: string;
+    sex: NPCSex;
+    age: number;
+    stage: LifeStage;
+    color: string;
+    visibleState: NPCAIState['state'];  // what they appear to be doing
+    isAlive: boolean;
+    homeId: string | null;
+    job: string | null;
+    inventoryCount: number;             // how many items they're carrying (observable)
+    hasPartner: boolean;
+    isPregnant: boolean;
 };
 
 // --- Render: Highlight (hover from UI) ---
@@ -457,7 +527,17 @@ export type WorldAPI = {
     consume: (itemId: string) => boolean;
     sleep: () => boolean;
     wakeUp: () => void;
-    propose: (targetId: string) => boolean;
+    /**
+     * Start mating with an existing partner (physical mechanics only).
+     * Returns result: 'ok' | 'too_far' | 'busy' | 'cooldown' | 'pregnant' | 'not_found'.
+     * Does NOT mutate AI state — the AI caller handles state transitions.
+     */
+    startMating: (targetId: string) => { success: boolean; reason: string };
+    /**
+     * Form a couple bond between this NPC and a target (physical relation only).
+     * Returns false if target is not found or too far.
+     */
+    formCouple: (targetId: string) => boolean;
     sendMessage: (targetId: string, message: NPCMessage) => boolean;
     getNearbyNPCs: (range: number) => EntityInfo[];
     buildCabin: () => boolean;
@@ -469,4 +549,16 @@ export type WorldAPI = {
     craft: (recipeId: string) => boolean;
     /** Get buildings near the NPC within a range */
     getNearbyBuildings: (range: number) => Array<EntityInfo & { buildingType: string }>;
+    /** Get observable info about a specific NPC by ID */
+    getNPCInfo: (id: string) => NPCInfo | null;
+    /** Get observable info about all nearby NPCs (enriched version of getNearbyNPCs) */
+    getNearbyNPCInfos: (range: number) => NPCInfo[];
+    /** Get this NPC's known children (from knowledge.relations) */
+    getChildInfos: () => NPCInfo[];
+    /** Get the stock item counts for another NPC's home (observable — the NPC must be nearby) */
+    getStockCountOf: (npcId: string, itemId: string) => number;
+    /** Take an item from trade partner's inventory (world-mediated exchange) */
+    takeItemFrom: (targetId: string, itemId: string) => boolean;
+    /** Attack a target NPC — resolves damage via combat system, returns damage dealt */
+    attack: (targetId: string) => number;
 };

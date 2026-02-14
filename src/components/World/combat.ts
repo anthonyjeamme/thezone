@@ -2,10 +2,10 @@
 //  COMBAT SYSTEM — Weapons, armor, attack resolution
 // =============================================================
 
-import { NPCEntity, Scene, countItem } from './Game.types';
-import { getItemDef, ItemDef } from './Game.registry';
-import { distance } from './Game.vector';
-import { logger } from './Game.logger';
+import { NPCEntity, Scene, countItem } from './types';
+import { getItemDef, ItemDef } from '../Shared/registry';
+import { distance } from '../Shared/vector';
+import { logger } from '../Shared/logger';
 
 // --- Combat constants ---
 

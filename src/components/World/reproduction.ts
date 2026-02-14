@@ -1,6 +1,6 @@
-import { AGE_MENOPAUSE, SECONDS_PER_SEASON, CONCEPTION_CHANCE, BuildingEntity, NPCEntity, NPCRelation, NPCTraits, Scene, getLifeStage, isFertile } from './Game.types';
-import { generateEntityId } from './Game.ids';
-import { logger } from './Game.logger';
+import { AGE_MENOPAUSE, SECONDS_PER_SEASON, CONCEPTION_CHANCE, BuildingEntity, NPCEntity, NPCRelation, NPCTraits, Scene, getLifeStage, isFertile } from './types';
+import { generateEntityId } from '../Shared/ids';
+import { logger } from '../Shared/logger';
 
 // --- Reproduction constants ---
 
@@ -123,7 +123,8 @@ function spawnBaby(scene: Scene, mother: NPCEntity) {
             })),
             npcs: [],
         },
-        ai: { state: 'idle', targetId: null, tickInterval: 0.1 + Math.random() * 0.05, tickAccumulator: 0, greetBubbleTimer: 0, restTimer: 0, tradeOffer: null, tradeWant: null, tradePhase: null, craftRecipeId: null, attackCooldown: 0 },
+        ai: { state: 'idle', targetId: null, tickInterval: 0.1 + Math.random() * 0.05, tickAccumulator: 0, greetBubbleTimer: 0, restTimer: 0, tradeOffer: null, tradeWant: null, tradePhase: null, craftRecipeId: null, attackCooldown: 0, sleepConsolidated: false },
+        actionHistory: [],
     };
 
     // Add baby to mother's cabin residents

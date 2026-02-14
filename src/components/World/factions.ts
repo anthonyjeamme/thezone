@@ -2,9 +2,9 @@
 //  FACTIONS — Village-based factions, relations, wars
 // =============================================================
 
-import { BuildingEntity, NPCEntity, Scene, StockEntity, countItem } from './Game.types';
-import { Vector2D, distance } from './Game.vector';
-import { logger } from './Game.logger';
+import { BuildingEntity, NPCEntity, Scene, StockEntity, countItem } from './types';
+import { Vector2D, distance } from '../Shared/vector';
+import { logger } from '../Shared/logger';
 
 // --- Faction types ---
 
@@ -226,10 +226,13 @@ export function checkFactionConflicts(scene: Scene) {
 
 /**
  * Check if two NPCs belong to hostile factions.
+ * Accepts either NPCEntity objects or raw NPC IDs.
  */
-export function areFactionsHostile(npcA: NPCEntity, npcB: NPCEntity): boolean {
-    const facA = getFactionOf(npcA.id);
-    const facB = getFactionOf(npcB.id);
+export function areFactionsHostile(npcA: NPCEntity | string, npcB: NPCEntity | string): boolean {
+    const idA = typeof npcA === 'string' ? npcA : npcA.id;
+    const idB = typeof npcB === 'string' ? npcB : npcB.id;
+    const facA = getFactionOf(idA);
+    const facB = getFactionOf(idB);
     if (!facA || !facB) return false;
     return getRelation(facA.id, facB.id) === 'hostile';
 }

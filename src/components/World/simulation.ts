@@ -4,21 +4,25 @@ import {
     STARVATION_LETHAL_TIME, DEHYDRATION_LETHAL_TIME,
     RESERVE_HUNGER_DECAY, RESERVE_THIRST_DECAY, RESERVE_REGEN_RATE,
     CONCEPTION_CHANCE,
-    BuildingEntity, EntityInfo, FertileZoneEntity, NPCEntity, NPCMessage,
+    BuildingEntity, EntityInfo, FertileZoneEntity, NPCEntity, NPCInfo, NPCMessage,
     ResourceEntity, ResourceType, Scene, StockEntity, WorldAPI,
     getCalendar, getLifeStage, getAgeDebuff, getNeedsDebuff, hasPartner, getPartnerId, isFertile,
     addItem, removeItem, countItem,
-} from './Game.types';
-import { getItemDef, getJobDef, getRecipeDef } from './Game.registry';
-import { evaluateMate } from './Game.perception';
-import { Vector2D, distance, normalize, subtract } from './Game.vector';
-import { generateEntityId } from './Game.ids';
-import { logger } from './Game.logger';
-import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from './Game.terrain';
+} from './types';
+import { getItemDef, getJobDef, getRecipeDef } from '../Shared/registry';
+// evaluateMate has been moved to the AI layer (Phase 2 refactoring)
+import { resolveAttack } from './combat';
+import { Vector2D, distance, normalize, subtract } from '../Shared/vector';
+import { generateEntityId } from '../Shared/ids';
+import { logger } from '../Shared/logger';
+import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from './terrain';
+import { processFlora } from './flora';
+import { processWeather } from './weather';
+import { processSoilCycles } from './fertility';
 import {
     processReproduction,
     MATING_DURATION, GESTATION_DURATION, PROPOSE_RANGE,
-} from './Game.reproduction';
+} from './reproduction';
 
 // --- World constants ---
 
@@ -74,6 +78,9 @@ export function processWorld(scene: Scene, dt: number) {
     processChildFeeding(scene);
     processReproduction(scene, dt);
     processFertileZones(scene, dt);
+    processWeather(scene, dt);
+    if (scene.soilGrid) processSoilCycles(scene.soilGrid, dt);
+    processFlora(scene, dt);
 }
 
 // --- World API (per-NPC interface) ---
@@ -284,77 +291,51 @@ export function createWorldAPI(scene: Scene, entity: NPCEntity): WorldAPI {
             }
         },
 
-        propose(targetId: string) {
-            if (entity.sex !== 'male') return false;
-
+        startMating(targetId: string) {
+            // Pure world mechanics: check physical prerequisites and set up mating actions.
+            // Does NOT mutate AI state — the AI handles that.
             const female = scene.entities.find(
-                (e): e is NPCEntity => e.id === targetId && e.type === 'npc' && e.sex === 'female'
+                (e): e is NPCEntity => e.id === targetId && e.type === 'npc'
             );
-            if (!female) { logger.debug('REPRO', `${entity.name}: female not found`); return false; }
+            if (!female) return { success: false, reason: 'not_found' };
 
             const dist = distance(entity.position, female.position);
+            if (dist > PROPOSE_RANGE * 2) return { success: false, reason: 'too_far' };
+            if (female.action !== null) return { success: false, reason: 'busy' };
+            if (female.reproduction.cooldown > 0) return { success: false, reason: 'cooldown' };
+            if (female.reproduction.gestation !== null) return { success: false, reason: 'pregnant' };
 
-            // Helper: release the female from waiting_for_mate if proposal fails
-            const releaseFemale = () => {
-                if (female.ai.state === 'waiting_for_mate') {
-                    female.ai.state = 'idle';
-                    female.ai.targetId = null;
-                }
+            logger.info('REPRO', `${entity.name}: mating with ${female.name}`);
+
+            // Both enter mating (physical actions only)
+            entity.movement = null;
+            female.movement = null;
+
+            const matingAction = {
+                type: 'mating' as const,
+                targetId: undefined,
+                duration: MATING_DURATION,
+                remaining: MATING_DURATION,
             };
+            entity.action = { ...matingAction, targetId: female.id };
+            female.action = { ...matingAction, targetId: entity.id };
 
-            const isPartner = hasPartner(entity) && getPartnerId(entity) === targetId;
+            return { success: true, reason: 'ok' };
+        },
 
-            if (isPartner) {
-                // --- Partner mating (at home) ---
-                if (dist > PROPOSE_RANGE * 2) { logger.debug('REPRO', `${entity.name}: partner too far`); return false; }
-                if (female.action !== null) { return false; }
-                if (female.reproduction.cooldown > 0) { return false; }
-                if (female.reproduction.gestation !== null) { return false; }
+        formCouple(targetId: string) {
+            // Pure world mechanics: form a couple bond between two NPCs.
+            const target = scene.entities.find(
+                (e): e is NPCEntity => e.id === targetId && e.type === 'npc'
+            );
+            if (!target) return false;
 
-                logger.info('REPRO', `${entity.name}: mating with partner ${female.name}`);
+            const dist = distance(entity.position, target.position);
+            if (dist > PROPOSE_RANGE) return false;
 
-                // Both enter mating
-                entity.movement = null;
-                female.movement = null;
-
-                const matingAction = {
-                    type: 'mating' as const,
-                    targetId: undefined,
-                    duration: MATING_DURATION,
-                    remaining: MATING_DURATION,
-                };
-                entity.action = { ...matingAction, targetId: female.id };
-                female.action = { ...matingAction, targetId: entity.id };
-
-                female.ai.state = 'mating';
-                female.ai.targetId = entity.id;
-
-                return true;
-            } else {
-                // --- Courtship: form a couple ---
-                if (dist > PROPOSE_RANGE) { logger.debug('REPRO', `${entity.name}: too far (${Math.round(dist)}px)`); releaseFemale(); return false; }
-                if (female.action !== null) { releaseFemale(); return false; }
-
-                const evaluation = evaluateMate(female, entity);
-                if (!evaluation.acceptable) {
-                    logger.info('REPRO', `${entity.name}: ${female.name} refuses (${evaluation.reason})`);
-                    releaseFemale();
-                    return false;
-                }
-
-                logger.info('REPRO', `${entity.name}: ${female.name} ACCEPTS couple!`);
-
-                // Form the couple (no mating yet — that happens later at home)
-                formCouple(scene, entity, female);
-
-                // Release female from waiting state
-                if (female.ai.state === 'waiting_for_mate') {
-                    female.ai.state = 'idle';
-                    female.ai.targetId = null;
-                }
-
-                return true;
-            }
+            logger.info('REPRO', `${entity.name}: forming couple with ${target.name}`);
+            formCoupleRelation(scene, entity, target);
+            return true;
         },
 
         sendMessage(targetId: string, message: NPCMessage) {
@@ -504,7 +485,6 @@ export function createWorldAPI(scene: Scene, entity: NPCEntity): WorldAPI {
             const duration = recipe.duration / (craftBonus * debuff);
 
             entity.action = { type: 'crafting', recipeId, duration, remaining: duration };
-            entity.ai.craftRecipeId = recipeId;
             return true;
         },
 
@@ -523,6 +503,98 @@ export function createWorldAPI(scene: Scene, entity: NPCEntity): WorldAPI {
             }
             return results;
         },
+
+        getNPCInfo(id: string): NPCInfo | null {
+            const target = scene.entities.find(
+                (e): e is NPCEntity => e.id === id && e.type === 'npc'
+            );
+            if (!target) return null;
+            return npcToInfo(target, entity);
+        },
+
+        getNearbyNPCInfos(range: number): NPCInfo[] {
+            const results: NPCInfo[] = [];
+            for (const e of scene.entities) {
+                if (e.type !== 'npc') continue;
+                if (e.id === entity.id) continue;
+                const dist = distance(entity.position, e.position);
+                if (dist <= range) {
+                    results.push(npcToInfo(e as NPCEntity, entity));
+                }
+            }
+            results.sort((a, b) => a.distance - b.distance);
+            return results;
+        },
+
+        getChildInfos(): NPCInfo[] {
+            const childIds = entity.knowledge.relations
+                .filter((r) => r.type === 'child')
+                .map((r) => r.targetId);
+            if (childIds.length === 0) return [];
+
+            const results: NPCInfo[] = [];
+            for (const cid of childIds) {
+                const child = scene.entities.find(
+                    (e): e is NPCEntity => e.id === cid && e.type === 'npc'
+                );
+                if (child) {
+                    results.push(npcToInfo(child, entity));
+                }
+            }
+            return results;
+        },
+
+        getStockCountOf(npcId: string, itemId: string): number {
+            const npc = scene.entities.find(
+                (e): e is NPCEntity => e.id === npcId && e.type === 'npc'
+            );
+            if (!npc || !npc.homeId) return 0;
+            const stock = scene.entities.find(
+                (e): e is StockEntity => e.type === 'stock' && e.cabinId === npc.homeId
+            );
+            if (!stock) return 0;
+            return countItem(stock.items, itemId);
+        },
+
+        takeItemFrom(targetId: string, itemId: string): boolean {
+            const target = scene.entities.find(
+                (e): e is NPCEntity => e.id === targetId && e.type === 'npc'
+            );
+            if (!target) return false;
+            if (distance(entity.position, target.position) > TRADE_RANGE) return false;
+            if (!removeItem(target.inventory, itemId, 1)) return false;
+            addItem(entity.inventory, itemId, 1);
+            return true;
+        },
+
+        attack(targetId: string): number {
+            const target = scene.entities.find(
+                (e): e is NPCEntity => e.id === targetId && e.type === 'npc'
+            );
+            if (!target) return 0;
+            return resolveAttack(entity, target);
+        },
+    };
+}
+
+/** Convert a raw NPCEntity into observable NPCInfo from the perspective of an observer */
+function npcToInfo(target: NPCEntity, observer: NPCEntity): NPCInfo {
+    return {
+        id: target.id,
+        position: { x: target.position.x, y: target.position.y },
+        distance: distance(observer.position, target.position),
+        name: target.name,
+        sex: target.sex,
+        age: target.age,
+        stage: getLifeStage(target.age),
+        color: target.color,
+        visibleState: target.ai.state,
+        isAlive: target.needs.health > 0,
+        homeId: target.homeId,
+        job: target.job,
+        inventoryCount: target.inventory.length,
+        hasPartner: hasPartner(target),
+        isPregnant: target.reproduction.gestation !== null,
     };
 }
 
@@ -769,8 +841,7 @@ function completeCraftAction(scene: Scene, npc: NPCEntity) {
     }
 
     npc.action = null;
-    npc.ai.craftRecipeId = null;
-    npc.ai.state = 'idle';
+    // AI state reset is handled by the AI layer (handleCrafting detects action completion)
 }
 
 function completeMatingAction(scene: Scene, npc: NPCEntity) {
@@ -808,7 +879,7 @@ function completeMatingAction(scene: Scene, npc: NPCEntity) {
 }
 
 /** Form a committed couple: both get 'partner' relation, one moves into the other's home */
-function formCouple(scene: Scene, a: NPCEntity, b: NPCEntity) {
+function formCoupleRelation(scene: Scene, a: NPCEntity, b: NPCEntity) {
     // Add partner relation
     a.knowledge.relations.push({ targetId: b.id, type: 'partner' });
     b.knowledge.relations.push({ targetId: a.id, type: 'partner' });
