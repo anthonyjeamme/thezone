@@ -382,7 +382,7 @@ class ThreeRenderer implements GameRenderer {
     private cameraPitch = 0.12;          // vertical angle (radians, 0 = horizontal)
     private mouseMoveHandler: ((e: MouseEvent) => void) | null = null;
     private pointerLockHandler: (() => void) | null = null;
-    private static readonly PLAYER_SPEED = 0.25;
+    private static readonly PLAYER_SPEED = 0.5;
     private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
     private static readonly MOUSE_SENSITIVITY = 0.00035;
     // Camera rig parameters
