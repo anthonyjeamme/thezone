@@ -2,8 +2,8 @@
 //  FLORA — Plant species definitions and growth logic
 // =============================================================
 
-import { computePlantFertility, getSoilAt, setSoilPropertyAt, SOIL_PROPERTIES, type PlantSoilNeeds, type SoilGrid } from './fertility';
-import { SECONDS_PER_DAY, type FruitEntity, type PlantEntity, type PlantGrowthStage, type Scene } from './types';
+import { computePlantFertility, getSoilAt, getSoilTypeAt, setSoilPropertyAt, SOIL_PROPERTIES, type PlantSoilNeeds, type SoilGrid } from './fertility';
+import { SECONDS_PER_DAY, isInWorldBounds, type FruitEntity, type PlantEntity, type PlantGrowthStage, type Scene } from './types';
 import { generateEntityId } from '../Shared/ids';
 
 // =============================================================
@@ -99,12 +99,12 @@ registerSpecies({
     color: '#4a7a3a',
     matureColor: '#2d5a1e',
     maxSize: 18,
-    growthDays: 2,
+    growthDays: 10,        // was 2 — more realistic, still fast for a tree
     resilience: 0.8,
     seedSpread: {
         minGrowth: 0.85,       // doit être quasi-mature
-        seedCount: 3,          // glands
-        intervalDays: 5,       // tous les 5 jours
+        seedCount: 2,          // glands
+        intervalDays: 7,       // tous les 7 jours
         radius: 120,           // tombent pas loin (gravité)
     },
     fruitProduction: {
@@ -130,12 +130,12 @@ registerSpecies({
     color: '#c8b84d',
     matureColor: '#d4a017',
     maxSize: 6,
-    growthDays: 12,
+    growthDays: 8,         // was 12 — faster crop cycle for gameplay
     resilience: 0.3,
     seedSpread: {
         minGrowth: 0.7,
-        seedCount: 5,          // beaucoup de grains
-        intervalDays: 3,
+        seedCount: 2,          // grains
+        intervalDays: 4,
         radius: 40,            // tombe au pied
     },
     fruitProduction: {
@@ -164,8 +164,8 @@ registerSpecies({
     resilience: 0.5,
     seedSpread: {
         minGrowth: 0.6,
-        seedCount: 4,
-        intervalDays: 2,       // se reproduit vite
+        seedCount: 2,
+        intervalDays: 4,       // se reproduit
         radius: 80,            // vent, insectes
     },
 });
@@ -186,8 +186,8 @@ registerSpecies({
     resilience: 0.55,
     seedSpread: {
         minGrowth: 0.7,
-        seedCount: 3,
-        intervalDays: 4,
+        seedCount: 2,
+        intervalDays: 5,
         radius: 60,            // oiseaux dispersent les graines
     },
     fruitProduction: {
@@ -197,7 +197,7 @@ registerSpecies({
         minGrowth: 0.75,
         fruitsPerCycle: 5,     // production généreuse
         intervalDays: 2,       // cycle rapide
-        dropRadius: 20,        // tombe au pied du buisson
+        dropRadius: 5,
         lifetimeDays: 3,       // fruit fragile, pourrit vite
     },
 });
@@ -213,12 +213,12 @@ registerSpecies({
     color: '#3a6e3a',
     matureColor: '#1e4d2b',
     maxSize: 15,
-    growthDays: 70,
+    growthDays: 40,        // was 70 — still slow but not unreasonably so
     resilience: 0.7,
     seedSpread: {
         minGrowth: 0.85,
-        seedCount: 4,          // pommes de pin
-        intervalDays: 6,
+        seedCount: 2,          // pommes de pin
+        intervalDays: 8,
         radius: 100,
     },
     fruitProduction: {
@@ -230,6 +230,240 @@ registerSpecies({
         intervalDays: 5,
         dropRadius: 50,
         lifetimeDays: 12,      // résistant, sèche lentement
+    },
+});
+
+// --- Forêt: Bouleau ---
+registerSpecies({
+    id: 'birch',
+    displayName: 'Bouleau',
+    soilNeeds: {
+        humidity: { ideal: 0.50, tolerance: 0.35, weight: 0.9 },
+        minerals: { ideal: 0.40, tolerance: 0.35, weight: 0.5 },
+        organicMatter: { ideal: 0.45, tolerance: 0.40, weight: 0.6 },
+        sunExposure: { ideal: 0.70, tolerance: 0.30, weight: 0.7 },
+    },
+    color: '#8fba7a',
+    matureColor: '#5a9a3e',
+    maxSize: 14,
+    growthDays: 20,
+    resilience: 0.65,
+    seedSpread: {
+        minGrowth: 0.7,
+        seedCount: 2,          // small seeds (wind-dispersed)
+        intervalDays: 5,
+        radius: 140,           // light seeds travel far
+    },
+});
+
+// --- Forêt: Champignon ---
+registerSpecies({
+    id: 'mushroom',
+    displayName: 'Champignon',
+    soilNeeds: {
+        humidity: { ideal: 0.60, tolerance: 0.25, weight: 1.0 },
+        minerals: { ideal: 0.30, tolerance: 0.40, weight: 0.3 },
+        organicMatter: { ideal: 0.70, tolerance: 0.25, weight: 1.2 },
+        sunExposure: { ideal: 0.20, tolerance: 0.25, weight: 1.0 }, // needs shade!
+    },
+    color: '#c4a882',
+    matureColor: '#a08060',
+    maxSize: 3,
+    growthDays: 3,             // very fast
+    resilience: 0.3,           // fragile
+    seedSpread: {
+        minGrowth: 0.6,
+        seedCount: 3,          // spores
+        intervalDays: 2,       // frequent
+        radius: 25,            // short range (spore drop)
+    },
+    fruitProduction: {
+        fruitName: 'Champignon',
+        fruitColor: '#D2B48C',
+        nutritionValue: 0.20,
+        minGrowth: 0.7,
+        fruitsPerCycle: 3,
+        intervalDays: 1.5,
+        dropRadius: 10,
+        lifetimeDays: 2,       // rots fast
+    },
+});
+
+// --- Prairie: Thym ---
+registerSpecies({
+    id: 'thyme',
+    displayName: 'Thym',
+    soilNeeds: {
+        humidity: { ideal: 0.25, tolerance: 0.30, weight: 0.8 },
+        minerals: { ideal: 0.50, tolerance: 0.35, weight: 0.7 },
+        sunExposure: { ideal: 0.90, tolerance: 0.15, weight: 1.0 },
+    },
+    color: '#7a9a6a',
+    matureColor: '#5c7c4e',
+    maxSize: 4,
+    growthDays: 8,
+    resilience: 0.7,           // drought-resistant
+    seedSpread: {
+        minGrowth: 0.65,
+        seedCount: 3,
+        intervalDays: 3,
+        radius: 50,
+    },
+    fruitProduction: {
+        fruitName: 'Thym séché',
+        fruitColor: '#8B7D6B',
+        nutritionValue: 0.05,  // spice, not food
+        minGrowth: 0.8,
+        fruitsPerCycle: 2,
+        intervalDays: 4,
+        dropRadius: 15,
+        lifetimeDays: 15,      // dried herb lasts long
+    },
+});
+
+// --- Prairie: Sauge ---
+registerSpecies({
+    id: 'sage',
+    displayName: 'Sauge',
+    soilNeeds: {
+        humidity: { ideal: 0.30, tolerance: 0.25, weight: 0.8 },
+        minerals: { ideal: 0.55, tolerance: 0.30, weight: 0.8 },
+        sunExposure: { ideal: 0.85, tolerance: 0.20, weight: 0.9 },
+    },
+    color: '#8aaa7a',
+    matureColor: '#6b8b5e',
+    maxSize: 4,
+    growthDays: 10,
+    resilience: 0.65,
+    seedSpread: {
+        minGrowth: 0.7,
+        seedCount: 3,
+        intervalDays: 4,
+        radius: 45,
+    },
+    fruitProduction: {
+        fruitName: 'Feuille de sauge',
+        fruitColor: '#7B8B6F',
+        nutritionValue: 0.05,  // herb
+        minGrowth: 0.8,
+        fruitsPerCycle: 2,
+        intervalDays: 5,
+        dropRadius: 12,
+        lifetimeDays: 10,
+    },
+});
+
+// --- Zone humide: Saule ---
+registerSpecies({
+    id: 'willow',
+    displayName: 'Saule',
+    soilNeeds: {
+        humidity: { ideal: 0.80, tolerance: 0.20, weight: 1.2 },
+        minerals: { ideal: 0.30, tolerance: 0.40, weight: 0.3 },
+        organicMatter: { ideal: 0.40, tolerance: 0.40, weight: 0.4 },
+        sunExposure: { ideal: 0.70, tolerance: 0.30, weight: 0.6 },
+    },
+    color: '#6aaa5a',
+    matureColor: '#4a8a3a',
+    maxSize: 16,
+    growthDays: 40,
+    resilience: 0.75,
+    seedSpread: {
+        minGrowth: 0.8,
+        seedCount: 3,
+        intervalDays: 6,
+        radius: 90,
+    },
+    // No fruit — willow doesn't produce edible fruits
+});
+
+// --- Zone humide: Roseau ---
+registerSpecies({
+    id: 'reed',
+    displayName: 'Roseau',
+    soilNeeds: {
+        humidity: { ideal: 0.90, tolerance: 0.15, weight: 1.3 },
+        minerals: { ideal: 0.20, tolerance: 0.40, weight: 0.2 },
+        organicMatter: { ideal: 0.30, tolerance: 0.40, weight: 0.3 },
+        sunExposure: { ideal: 0.80, tolerance: 0.25, weight: 0.7 },
+    },
+    color: '#8aaa6a',
+    matureColor: '#7a9a5a',
+    maxSize: 5,
+    growthDays: 4,             // very fast
+    resilience: 0.5,
+    seedSpread: {
+        minGrowth: 0.5,
+        seedCount: 3,          // rhizome reproduction
+        intervalDays: 3,
+        radius: 35,            // short range, dense colonies
+    },
+    // No fruit
+});
+
+// --- Fruitier: Pommier ---
+registerSpecies({
+    id: 'apple',
+    displayName: 'Pommier',
+    soilNeeds: {
+        humidity: { ideal: 0.55, tolerance: 0.25, weight: 1.0 },
+        minerals: { ideal: 0.55, tolerance: 0.25, weight: 0.9 },
+        organicMatter: { ideal: 0.60, tolerance: 0.25, weight: 0.8 },
+        sunExposure: { ideal: 0.75, tolerance: 0.25, weight: 0.8 },
+    },
+    color: '#5a8a4a',
+    matureColor: '#3a6a2a',
+    maxSize: 12,
+    growthDays: 30,
+    resilience: 0.6,
+    seedSpread: {
+        minGrowth: 0.85,
+        seedCount: 2,          // few seeds (from eaten apples)
+        intervalDays: 6,
+        radius: 80,            // animals carry seeds
+    },
+    fruitProduction: {
+        fruitName: 'Pomme',
+        fruitColor: '#CC3333',
+        nutritionValue: 0.40,  // excellent food
+        minGrowth: 0.85,
+        fruitsPerCycle: 5,
+        intervalDays: 3,
+        dropRadius: 40,
+        lifetimeDays: 6,
+    },
+});
+
+// --- Fruitier: Cerisier ---
+registerSpecies({
+    id: 'cherry',
+    displayName: 'Cerisier',
+    soilNeeds: {
+        humidity: { ideal: 0.50, tolerance: 0.25, weight: 1.0 },
+        minerals: { ideal: 0.50, tolerance: 0.30, weight: 0.8 },
+        organicMatter: { ideal: 0.55, tolerance: 0.30, weight: 0.7 },
+        sunExposure: { ideal: 0.80, tolerance: 0.20, weight: 0.9 },
+    },
+    color: '#6a8a5a',
+    matureColor: '#4a6a3a',
+    maxSize: 11,
+    growthDays: 25,
+    resilience: 0.55,
+    seedSpread: {
+        minGrowth: 0.85,
+        seedCount: 3,
+        intervalDays: 5,
+        radius: 90,            // birds carry cherry seeds far
+    },
+    fruitProduction: {
+        fruitName: 'Cerise',
+        fruitColor: '#8B0000',
+        nutritionValue: 0.30,  // tasty fruit
+        minGrowth: 0.8,
+        fruitsPerCycle: 8,     // abundant producer
+        intervalDays: 2,
+        dropRadius: 35,
+        lifetimeDays: 4,       // fragile fruit
     },
 });
 
@@ -255,13 +489,13 @@ function computeStage(growth: number, healthRatio: number): PlantGrowthStage {
  * over a full growth cycle — enough to matter with multiple plants,
  * not enough to self-destruct alone.
  */
-const GROWTH_DRAIN_RATE = 0.00003;
+const GROWTH_DRAIN_RATE = 0.00015;
 
 /**
  * Mature plants still need resources, but much less (maintenance).
  * Expressed as a fraction of the growth drain.
  */
-const MAINTENANCE_FRACTION = 0.15;
+const MAINTENANCE_FRACTION = 0.4;
 
 /**
  * Drain soil nutrients at the plant's position.
@@ -318,7 +552,10 @@ function cellIndex(grid: SoilGrid, worldX: number, worldY: number): number {
 // =============================================================
 
 /** How much organic matter a fully-grown plant of maxSize=1 returns */
-const DECOMPOSE_BASE_ORGANIC = 0.12;
+const DECOMPOSE_BASE_ORGANIC = 0.25;
+
+/** How much minerals a fully-grown plant of maxSize=1 returns at death */
+const DECOMPOSE_BASE_MINERALS = 0.08;
 
 /** Radius in cells around the plant that receives organic matter */
 const DECOMPOSE_RADIUS_CELLS = 2;
@@ -357,12 +594,162 @@ function decomposeIntoSoil(grid: SoilGrid, plant: PlantEntity, species: PlantSpe
 
     if (totalW <= 0) return;
 
-    // Distribute organic matter weighted by proximity
+    // Distribute organic matter AND minerals weighted by proximity
     const organicLayer = grid.layers.organicMatter;
+    const mineralLayer = grid.layers.minerals;
+    const totalMinerals = DECOMPOSE_BASE_MINERALS * biomass;
+
     for (const { idx, w } of cells) {
-        const share = totalOrganic * (w / totalW);
-        organicLayer[idx] = Math.min(1, organicLayer[idx] + share);
+        const frac = w / totalW;
+        organicLayer[idx] = Math.min(1, organicLayer[idx] + totalOrganic * frac);
+        mineralLayer[idx] = Math.min(1, mineralLayer[idx] + totalMinerals * frac);
     }
+}
+
+// =============================================================
+//  SPATIAL HASH GRID — O(1) proximity queries instead of O(n)
+// =============================================================
+
+const SPATIAL_CELL = 100; // px per cell — must be >= largest query radius
+
+type SpatialGrid = {
+    cells: Map<number, PlantEntity[]>;
+    cellSize: number;
+    originX: number;
+    originY: number;
+    cols: number;
+};
+
+let _spatialGrid: SpatialGrid | null = null;
+
+function buildSpatialGrid(scene: Scene): SpatialGrid {
+    const cellSize = SPATIAL_CELL;
+    const originX = -1200;
+    const originY = -1200;
+    const cols = Math.ceil(2400 / cellSize);
+    const cells = new Map<number, PlantEntity[]>();
+
+    for (const entity of scene.entities) {
+        if (entity.type !== 'plant') continue;
+        const p = entity as PlantEntity;
+        if (p.health <= 0) continue;
+        const c = Math.floor((p.position.x - originX) / cellSize);
+        const r = Math.floor((p.position.y - originY) / cellSize);
+        const key = r * cols + c;
+        let bucket = cells.get(key);
+        if (!bucket) { bucket = []; cells.set(key, bucket); }
+        bucket.push(p);
+    }
+
+    _spatialGrid = { cells, cellSize, originX, originY, cols };
+    return _spatialGrid;
+}
+
+/** Query all plants within a radius from a point using the spatial grid */
+function queryNearby(grid: SpatialGrid, x: number, y: number, radius: number, exclude?: PlantEntity): PlantEntity[] {
+    const result: PlantEntity[] = [];
+    const r2 = radius * radius;
+    const minC = Math.floor((x - radius - grid.originX) / grid.cellSize);
+    const maxC = Math.floor((x + radius - grid.originX) / grid.cellSize);
+    const minR = Math.floor((y - radius - grid.originY) / grid.cellSize);
+    const maxR = Math.floor((y + radius - grid.originY) / grid.cellSize);
+
+    for (let r = minR; r <= maxR; r++) {
+        for (let c = minC; c <= maxC; c++) {
+            const bucket = grid.cells.get(r * grid.cols + c);
+            if (!bucket) continue;
+            for (const p of bucket) {
+                if (p === exclude) continue;
+                const dx = p.position.x - x;
+                const dy = p.position.y - y;
+                if (dx * dx + dy * dy < r2) result.push(p);
+            }
+        }
+    }
+    return result;
+}
+
+// =============================================================
+//  COMPETITION / DENSITY — nearby plants reduce growth rate
+// =============================================================
+
+/** Max density check radius in px. Plants within this get counted. */
+const CROWD_RADIUS_BASE = 40; // px — scaled by species maxSize
+
+/** Max neighbor count before growth starts to be penalized */
+const CROWD_MAX_NEIGHBORS = 3;
+
+/**
+ * Count how many living plants are within crowding radius of a given plant.
+ * Returns a growth multiplier [0.0 .. 1.0] — 1.0 = no penalty, 0.0 = full stop.
+ */
+function getCrowdingFactor(plant: PlantEntity, species: PlantSpecies): number {
+    if (!_spatialGrid) return 1.0;
+    const radius = CROWD_RADIUS_BASE * (species.maxSize / 10);
+    const nearby = queryNearby(_spatialGrid, plant.position.x, plant.position.y, radius, plant);
+    // Only count plants above seedling stage
+    const count = nearby.filter(p => p.growth >= 0.1).length;
+
+    if (count <= CROWD_MAX_NEIGHBORS) return 1.0;
+    // Linear penalty: goes from 1.0 at maxNeighbors to 0.0 at 4x maxNeighbors
+    return Math.max(0.0, 1 - (count - CROWD_MAX_NEIGHBORS) / (CROWD_MAX_NEIGHBORS * 3));
+}
+
+// =============================================================
+//  GERMINATION — seeds need adequate soil to sprout
+// =============================================================
+
+/** Minimum fertility for a seed to germinate */
+const GERMINATION_MIN_FERTILITY = 0.25;
+
+/** Max dormancy time in game days — after this, seed dies if soil is still bad */
+const MAX_DORMANCY_DAYS = 1.5;
+
+// =============================================================
+//  DENSITY CAP — prevent over-seeding in a small area
+// =============================================================
+
+/** Max same-species plants allowed in seed radius before blocking new seeds */
+const DENSITY_CAP = 4;
+
+/**
+ * Check if an area already has too many plants of the same species.
+ * Uses the spatial grid for fast lookup.
+ */
+function isAreaOvercrowded(speciesId: string, x: number, y: number, radius: number): boolean {
+    if (!_spatialGrid) return false;
+    const nearby = queryNearby(_spatialGrid, x, y, radius);
+    let count = 0;
+    for (const p of nearby) {
+        if (p.speciesId === speciesId) {
+            count++;
+            if (count >= DENSITY_CAP) return true;
+        }
+    }
+    return false;
+}
+
+// =============================================================
+//  CROSS-POLLINATION — bonus fruit production near same-species
+// =============================================================
+
+/** Radius to check for same-species neighbors for pollination bonus */
+const POLLINATION_RADIUS = 80;
+
+/** Bonus multiplier for fruit production when pollinated */
+const POLLINATION_BONUS = 1.2;
+
+/**
+ * Check if a mature plant has a same-species neighbor nearby.
+ * Returns a fruit production multiplier (1.0 or POLLINATION_BONUS).
+ */
+function getPollinationFactor(plant: PlantEntity): number {
+    if (!_spatialGrid) return 1.0;
+    const nearby = queryNearby(_spatialGrid, plant.position.x, plant.position.y, POLLINATION_RADIUS, plant);
+    for (const other of nearby) {
+        if (other.speciesId === plant.speciesId && other.growth >= 0.5) return POLLINATION_BONUS;
+    }
+    return 1.0;
 }
 
 // =============================================================
@@ -398,6 +785,9 @@ function tryDisperse(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt
     // Reset timer
     plant.seedTimer = DAYS(spread.intervalDays);
 
+    // Check density cap — don't over-seed if area is already full
+    if (isAreaOvercrowded(species.id, plant.position.x, plant.position.y, spread.radius)) return;
+
     // Disperse seeds
     for (let s = 0; s < spread.seedCount; s++) {
         const angle = Math.random() * Math.PI * 2;
@@ -408,6 +798,9 @@ function tryDisperse(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt
             x: plant.position.x + Math.cos(angle) * dist,
             y: plant.position.y + Math.sin(angle) * dist,
         };
+
+        // Don't drop seeds outside the world
+        if (!isInWorldBounds(seedPos.x, seedPos.y)) continue;
 
         // Don't drop seeds into water
         if (scene.lakesEnabled && scene.soilGrid) {
@@ -426,6 +819,7 @@ function tryDisperse(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt
             stage: 'seed',
             seedTimer: 0,
             fruitTimer: 0,
+            dormancyTimer: DAYS(MAX_DORMANCY_DAYS),
         };
 
         scene.entities.push(seed);
@@ -457,7 +851,9 @@ function tryProduceFruits(scene: Scene, plant: PlantEntity, species: PlantSpecie
 
     // Health factor: healthier plants produce more fruits
     const healthFactor = Math.min(1, plant.health / 80);
-    const count = Math.max(1, Math.round(fp.fruitsPerCycle * healthFactor));
+    // Cross-pollination bonus: +20% when same-species neighbor is nearby
+    const pollinationMult = getPollinationFactor(plant);
+    const count = Math.max(1, Math.round(fp.fruitsPerCycle * healthFactor * pollinationMult));
 
     for (let i = 0; i < count; i++) {
         const angle = Math.random() * Math.PI * 2;
@@ -467,6 +863,9 @@ function tryProduceFruits(scene: Scene, plant: PlantEntity, species: PlantSpecie
             x: plant.position.x + Math.cos(angle) * dist,
             y: plant.position.y + Math.sin(angle) * dist,
         };
+
+        // Don't drop fruits outside the world
+        if (!isInWorldBounds(fruitPos.x, fruitPos.y)) continue;
 
         // Don't drop fruits into water
         if (scene.lakesEnabled && scene.soilGrid) {
@@ -484,6 +883,7 @@ function tryProduceFruits(scene: Scene, plant: PlantEntity, species: PlantSpecie
             age: 0,
             maxAge: DAYS(fp.lifetimeDays),
             color: fp.fruitColor,
+            parentPlantId: plant.id,
         };
 
         scene.entities.push(fruit);
@@ -516,7 +916,7 @@ function processFruits(scene: Scene, dt: number) {
                     // Small amount of organic matter from decomposing fruit
                     soilGrid.layers.organicMatter[idx] = Math.min(
                         1,
-                        soilGrid.layers.organicMatter[idx] + 0.005 * fruit.nutritionValue,
+                        soilGrid.layers.organicMatter[idx] + 0.01 * fruit.nutritionValue,
                     );
                 }
             }
@@ -600,6 +1000,9 @@ function updateCanopy(scene: Scene) {
 export function processFlora(scene: Scene, dt: number) {
     const soilGrid = scene.soilGrid;
 
+    // --- Rebuild spatial index for fast proximity queries ---
+    buildSpatialGrid(scene);
+
     // --- Periodic canopy update ---
     canopyTimer += dt;
     if (canopyTimer >= CANOPY_UPDATE_INTERVAL) {
@@ -624,7 +1027,34 @@ export function processFlora(scene: Scene, dt: number) {
         let fertility = 0.5;
         if (soilGrid) {
             const sample = getSoilAt(soilGrid, plant.position.x, plant.position.y);
-            fertility = computePlantFertility(sample, species.soilNeeds);
+            const stIdx = getSoilTypeAt(soilGrid, plant.position.x, plant.position.y);
+            fertility = computePlantFertility(sample, species.soilNeeds, stIdx);
+        }
+
+        // --- Seed dormancy: seeds wait for good soil, die if too long ---
+        if (plant.stage === 'seed' && plant.growth < 0.02) {
+            if (plant.dormancyTimer > 0) {
+                plant.dormancyTimer -= dt;
+                // Check if soil is good enough to germinate
+                if (fertility >= GERMINATION_MIN_FERTILITY) {
+                    plant.dormancyTimer = 0; // germinate!
+                } else if (plant.dormancyTimer <= 0) {
+                    // Dormancy expired, soil still bad → seed dies
+                    plant.health = 0;
+                    plant.stage = 'dead';
+                    // Return tiny organic matter
+                    if (soilGrid) {
+                        const idx = cellIndex(soilGrid, plant.position.x, plant.position.y);
+                        if (idx >= 0) {
+                            soilGrid.layers.organicMatter[idx] = Math.min(1, soilGrid.layers.organicMatter[idx] + 0.002);
+                        }
+                    }
+                    scene.entities.splice(i, 1);
+                    continue;
+                } else {
+                    continue; // still dormant, skip all processing
+                }
+            }
         }
 
         // --- Submersion: plants drown in water ---
@@ -633,7 +1063,6 @@ export function processFlora(scene: Scene, dt: number) {
             if (idx >= 0) {
                 const wl = soilGrid.waterLevel[idx];
                 if (wl > 0.3 && plant.health > 0) {
-                    // Submerged — take heavy damage
                     const drownDamage = HEALTH_STRESS_RATE * 2 * wl * dt;
                     plant.health = Math.max(0, plant.health - drownDamage);
                 }
@@ -652,12 +1081,13 @@ export function processFlora(scene: Scene, dt: number) {
             }
         }
 
-        // --- Growth ---
+        // --- Growth (with crowding penalty) ---
         const prevGrowth = plant.growth;
         if (plant.health > 0 && plant.growth < 1) {
             if (fertility >= FERTILITY_COMFORT * 0.5) {
                 const growthFertility = Math.min(1, fertility / 0.8);
-                const growthDelta = growthRate * growthFertility * dt;
+                const crowdFactor = getCrowdingFactor(plant, species);
+                const growthDelta = growthRate * growthFertility * crowdFactor * dt;
                 plant.growth = Math.min(1, plant.growth + growthDelta);
 
                 if (soilGrid) {
@@ -671,15 +1101,20 @@ export function processFlora(scene: Scene, dt: number) {
             consumeSoil(soilGrid, plant, species.soilNeeds, 0, dt);
         }
 
-        // --- Leaf litter: mature living plants continuously add organic matter ---
+        // --- Leaf litter: mature living plants continuously add organic matter + trace minerals ---
         if (soilGrid && plant.health > 0 && plant.growth > 0.8) {
             const idx = cellIndex(soilGrid, plant.position.x, plant.position.y);
             if (idx >= 0) {
-                // Larger trees deposit more litter; rate is very slow
-                const litterRate = 0.000005 * (species.maxSize / 18) * plant.growth;
+                // Larger trees deposit more litter; rate is slow but meaningful
+                const litterRate = 0.000015 * (species.maxSize / 18) * plant.growth;
                 soilGrid.layers.organicMatter[idx] = Math.min(
                     1,
                     soilGrid.layers.organicMatter[idx] + litterRate * dt,
+                );
+                // Trace mineral return from leaf decomposition (~20% of organic rate)
+                soilGrid.layers.minerals[idx] = Math.min(
+                    1,
+                    soilGrid.layers.minerals[idx] + litterRate * 0.2 * dt,
                 );
             }
         }

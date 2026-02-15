@@ -17,11 +17,10 @@ export type HeightMap = {
     cellSize: number;
     originX: number;
     originY: number;
-    /** Height values in world units, row-major */
     data: Float32Array;
-    /** Min/max height for normalization */
     minHeight: number;
     maxHeight: number;
+    seaLevel: number;
 };
 
 // =============================================================
@@ -33,6 +32,8 @@ export type HeightMap = {
  * Heights are in world units (px). The map shares the same grid
  * dimensions as the soil grid for easy cross-referencing.
  */
+export const SEA_LEVEL = 15;
+
 export function createHeightMap(
     originX: number,
     originY: number,
@@ -51,7 +52,6 @@ export function createHeightMap(
     const n2 = createNoise2D(() => rng());
     const n3 = createNoise2D(() => rng());
 
-    // Noise scales for terrain: big smooth hills + medium bumps + fine detail
     const S1 = 0.0012;
     const S2 = 0.005;
     const S3 = 0.018;
@@ -64,12 +64,11 @@ export function createHeightMap(
             const wx = originX + col * cellSize;
             const wy = originY + row * cellSize;
 
-            const v1 = n1(wx * S1, wy * S1) * 0.6;   // large hills
-            const v2 = n2(wx * S2, wy * S2) * 0.3;   // medium bumps
-            const v3 = n3(wx * S3, wy * S3) * 0.1;   // fine noise
+            const v1 = n1(wx * S1, wy * S1) * 0.6;
+            const v2 = n2(wx * S2, wy * S2) * 0.3;
+            const v3 = n3(wx * S3, wy * S3) * 0.1;
 
-            // Combine: [-1..1] → [0..maxElevation]
-            const raw = (v1 + v2 + v3 + 1) * 0.5; // normalize to [0..1]
+            const raw = (v1 + v2 + v3 + 1) * 0.5;
             const h = raw * maxElevation;
 
             data[row * cols + col] = h;
@@ -78,7 +77,7 @@ export function createHeightMap(
         }
     }
 
-    return { cols, rows, cellSize, originX, originY, data, minHeight: minH, maxHeight: maxH };
+    return { cols, rows, cellSize, originX, originY, data, minHeight: minH, maxHeight: maxH, seaLevel: SEA_LEVEL };
 }
 
 // =============================================================

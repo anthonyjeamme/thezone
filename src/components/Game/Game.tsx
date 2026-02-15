@@ -5,14 +5,14 @@ import classNameModule from '@anthonyjeamme/classname';
 import styles from './Game.module.scss';
 import { processWorld } from '../World/simulation';
 import { processAI } from '../AI/brain';
-import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_DAY, SECONDS_PER_HOUR, Scene, getCalendar, getLifeStage } from '../World/types';
+import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_DAY, SECONDS_PER_HOUR, WORLD_HALF, Scene, getCalendar, getLifeStage } from '../World/types';
 import { getItemDef } from '../Shared/registry';
 import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from '../World/terrain';
 import { generateEntityId } from '../Shared/ids';
 import { /* initFactions, */ updateFactionStats, checkFactionConflicts } from '../World/factions';
 import { processEvents } from '../World/events';
 import { createSoilGrid } from '../World/fertility';
-import { createHeightMap, createBasinMap, createDepressionMap } from '../World/heightmap';
+import { createHeightMap, createBasinMap, createDepressionMap, getHeightAt, SEA_LEVEL } from '../World/heightmap';
 import { createWeatherState, WEATHER_LABELS, WEATHER_ICONS, WEATHER_TYPES } from '../World/weather';
 import type { WeatherType } from '../World/weather';
 import { GameRenderer, createRenderer, getAvailableRenderers, SoilOverlay } from '../Render/GameRenderer';
@@ -285,17 +285,28 @@ function generateResourceCluster(
     }
 }
 
-function generateTestPlants(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid) {
-    const WORLD_HALF = 1200;
-    const MARGIN = 100; // stay away from edges
+function generateTestPlants(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap) {
+    const MARGIN = 100;
 
     // Species configs: id, count, preferred humidity range, growth range
     const speciesSetup: { id: string; count: number; humRange: [number, number]; growthRange: [number, number] }[] = [
-        { id: 'oak',        count: 25, humRange: [0.35, 0.80], growthRange: [0.0, 1.0] },
-        { id: 'pine',       count: 20, humRange: [0.20, 0.60], growthRange: [0.0, 1.0] },
-        { id: 'wheat',      count: 30, humRange: [0.40, 0.75], growthRange: [0.0, 0.9] },
-        { id: 'wildflower', count: 20, humRange: [0.25, 0.70], growthRange: [0.0, 0.8] },
-        { id: 'raspberry',  count: 20, humRange: [0.40, 0.75], growthRange: [0.0, 1.0] },
+        // Forest
+        { id: 'oak',        count: 20, humRange: [0.35, 0.80], growthRange: [0.0, 1.0] },
+        { id: 'pine',       count: 18, humRange: [0.20, 0.60], growthRange: [0.0, 1.0] },
+        { id: 'birch',      count: 15, humRange: [0.30, 0.70], growthRange: [0.0, 1.0] },
+        { id: 'mushroom',   count: 12, humRange: [0.50, 0.85], growthRange: [0.0, 0.9] },
+        // Meadow
+        { id: 'wheat',      count: 25, humRange: [0.35, 0.65], growthRange: [0.0, 0.9] },
+        { id: 'wildflower', count: 18, humRange: [0.25, 0.70], growthRange: [0.0, 0.8] },
+        { id: 'thyme',      count: 12, humRange: [0.10, 0.40], growthRange: [0.0, 0.9] },
+        { id: 'sage',       count: 10, humRange: [0.15, 0.45], growthRange: [0.0, 0.9] },
+        // Wetland
+        { id: 'willow',     count: 8,  humRange: [0.65, 1.00], growthRange: [0.0, 1.0] },
+        { id: 'reed',       count: 15, humRange: [0.75, 1.00], growthRange: [0.0, 0.8] },
+        // Fruit trees
+        { id: 'raspberry',  count: 15, humRange: [0.40, 0.75], growthRange: [0.0, 1.0] },
+        { id: 'apple',      count: 10, humRange: [0.40, 0.70], growthRange: [0.0, 1.0] },
+        { id: 'cherry',     count: 10, humRange: [0.35, 0.65], growthRange: [0.0, 1.0] },
     ];
 
     for (const setup of speciesSetup) {
@@ -308,7 +319,8 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
             const x = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
             const y = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
 
-            // Check soil humidity — prefer matching terrain
+            if (getHeightAt(heightMap, x, y) < SEA_LEVEL + 3) continue;
+
             const col = Math.floor((x - soilGrid.originX) / soilGrid.cellSize);
             const row = Math.floor((y - soilGrid.originY) / soilGrid.cellSize);
             if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
@@ -334,6 +346,7 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
                 stage,
                 seedTimer: Math.random() * SECONDS_PER_DAY * 2,
                 fruitTimer: Math.random() * SECONDS_PER_DAY * 2,
+                dormancyTimer: 0, // already placed, no dormancy
             };
             entities.push(plant);
             placed++;
@@ -351,27 +364,47 @@ function createInitialScene(): Scene {
     //     generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
     // }
 
-    // Generate terrain
-    const WORLD_HALF = 1200;
     const CELL_SIZE = 32;
+    const heightMap = createHeightMap(
+        -WORLD_HALF, -WORLD_HALF,
+        WORLD_HALF * 2, WORLD_HALF * 2,
+        CELL_SIZE,
+        150,
+        77,
+    );
     const soilGrid = createSoilGrid(
         -WORLD_HALF, -WORLD_HALF,
         WORLD_HALF * 2, WORLD_HALF * 2,
         CELL_SIZE,
         42,
-    );
-    const heightMap = createHeightMap(
-        -WORLD_HALF, -WORLD_HALF,
-        WORLD_HALF * 2, WORLD_HALF * 2,
-        CELL_SIZE,
-        150,   // max elevation in world units (px)
-        77,    // different seed from soil
+        heightMap,
     );
     const basinMap = createBasinMap(heightMap);
     const depressionMap = createDepressionMap(heightMap);
 
     // Scatter initial plants across the map
-    generateTestPlants(entities, soilGrid);
+    generateTestPlants(entities, soilGrid, heightMap);
+
+    // Spawn raspberry bushes near player start (0,0) for testing
+    for (let i = 0; i < 6; i++) {
+        const angle = (i / 6) * Math.PI * 2;
+        const dist = 15 + Math.random() * 20;
+        const rx = Math.cos(angle) * dist;
+        const ry = Math.sin(angle) * dist;
+        entities.push({
+            id: `plant-${generateEntityId()}`,
+            type: 'plant',
+            speciesId: 'raspberry',
+            position: { x: rx, y: ry },
+            growth: 1.0,
+            health: 100,
+            age: SECONDS_PER_DAY * 10,
+            stage: 'mature',
+            seedTimer: SECONDS_PER_DAY,
+            fruitTimer: 0.1,
+            dormancyTimer: 0,
+        });
+    }
 
     const weather = createWeatherState();
     const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true };
@@ -733,7 +766,13 @@ export const Game = () => {
                     {...className('SoilLayerBtn', { active: soilOverlay === 'water' })}
                     onClick={() => setSoilOverlay(soilOverlay === 'water' ? null : 'water')}
                 >
-                    💧 Eau
+                    Eau
+                </button>
+                <button
+                    {...className('SoilLayerBtn', { active: soilOverlay === 'soilType' })}
+                    onClick={() => setSoilOverlay(soilOverlay === 'soilType' ? null : 'soilType')}
+                >
+                    Geologie
                 </button>
             </div>
 

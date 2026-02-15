@@ -12,7 +12,9 @@ import {
 } from '../../World/types';
 import { getSpecies } from '../../World/flora';
 import { Vector2D } from '../../Shared/vector';
+import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
 import type { SoilGrid, SoilProperty } from '../../World/fertility';
+import { SEA_LEVEL } from '../../World/heightmap';
 import type { HeightMap, BasinMap } from '../../World/heightmap';
 import { getHeightAt } from '../../World/heightmap';
 import type { SoilOverlay } from '../GameRenderer';
@@ -155,7 +157,7 @@ function createMinecraftCharacter(color: string, stage: LifeStage): THREE.Group 
 }
 
 // --- Walk animation ---
-function animateWalk(group: THREE.Group, time: number, isMoving: boolean) {
+function animateWalk(group: THREE.Group, time: number, isMoving: boolean, sprint = false) {
     const leftArm = group.getObjectByName('leftArm');
     const rightArm = group.getObjectByName('rightArm');
     const leftLeg = group.getObjectByName('leftLeg');
@@ -170,7 +172,9 @@ function animateWalk(group: THREE.Group, time: number, isMoving: boolean) {
         return;
     }
 
-    const swing = Math.sin(time * 8) * 0.6;
+    const freq = sprint ? 14 : 8;
+    const amp = sprint ? 0.85 : 0.6;
+    const swing = Math.sin(time * freq) * amp;
     if (leftArm) leftArm.rotation.x = swing;
     if (rightArm) rightArm.rotation.x = -swing;
     if (leftLeg) leftLeg.rotation.x = -swing;
@@ -303,9 +307,12 @@ class ThreeRenderer implements GameRenderer {
     // Instanced rendering pools
     private plantPartCache = new Map<string, PlantPartDef[]>();
     private plantInstances = new Map<string, THREE.InstancedMesh>();
+    private trunkTextures = new Map<string, THREE.Texture>();
+    private foliageTextures = new Map<string, THREE.Texture>();
     private fruitGeo: THREE.SphereGeometry | null = null;
     private fruitMatCache = new Map<string, THREE.MeshLambertMaterial>();
     private fruitInstances = new Map<string, THREE.InstancedMesh>();
+    private fruitRenderedPos = new Map<string, { x: number; y: number; z: number }>();
     private highlightMesh: THREE.Mesh | null = null;
 
     // Ground
@@ -314,44 +321,108 @@ class ThreeRenderer implements GameRenderer {
     private groundHeightApplied = false;
     private currentOverlay: SoilOverlay = undefined as unknown as SoilOverlay; // force first update
     private groundTexture: THREE.CanvasTexture | null = null;
+    // Texture splatting (default view — no overlay)
+    private groundSplatMat: THREE.MeshLambertMaterial | null = null;
+    private groundOverlayMat: THREE.MeshLambertMaterial | null = null;
+    private groundSplatShaderRef: { uniforms: Record<string, { value: unknown }> } | null = null;
+    private splatCanvas: HTMLCanvasElement | null = null;
+    private splatTexture: THREE.CanvasTexture | null = null;
+    private grassDetailTex: THREE.Texture | null = null;
+    private dirtDetailTex: THREE.Texture | null = null;
+    // Ocean plane (infinite water around island)
+    private oceanMesh: THREE.Mesh | null = null;
     // Water mesh for lakes
     private waterMesh: THREE.Mesh | null = null;
     private waterGeometry: THREE.PlaneGeometry | null = null;
     private waterTexture: THREE.CanvasTexture | null = null;
     private waterUpdateTimer = 0;
     private static readonly WATER_UPDATE_INTERVAL = 500; // ms between water mesh updates
-    // Grass chunk system — streams grass around camera
-    private grassChunks = new Map<string, { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh }>();
+    // Grass LOD chunk system
+    private grassChunks = new Map<string, { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number }>();
     private grassMat: THREE.MeshLambertMaterial | null = null;
     private grassPlaneGeo: THREE.PlaneGeometry | null = null;
     private grassLastCamX = Infinity;
     private grassLastCamZ = Infinity;
-    private static readonly GRASS_CHUNK_SIZE = 60;    // world units per chunk
-    private static readonly GRASS_RENDER_RADIUS = 250; // world units — chunks within this radius
-    private static readonly GRASS_STEP = 0.7;          // world units between patches
-    private static readonly GRASS_FADE_START = 0.7;    // start fading at 70% of render radius
+    private static readonly GRASS_CHUNK_SIZE = 80;
+    private static readonly GRASS_RENDER_RADIUS = 550;
+    private static readonly GRASS_LOD_BOUNDARY = 180;
+    private static readonly GRASS_STEP_NEAR = 1.0;
+    private static readonly GRASS_STEP_FAR = 3.5;
+    private static readonly GRASS_SCALE_FAR = 1.6;
     // Sun light
     private sunLight: THREE.DirectionalLight | null = null;
+    // Weather effects
+    private rainMesh: THREE.LineSegments | null = null;
+    private rainPositions: Float32Array | null = null;
+    private static readonly RAIN_COUNT = 20000;
+    private static readonly RAIN_AREA = 40;
+    private static readonly RAIN_HEIGHT_RANGE = 15;
+    private static readonly RAIN_SPEED = 25;
+    private static readonly RAIN_STREAK = 0.35;
+    private snowMesh: THREE.Points | null = null;
+    private snowPositions: Float32Array | null = null;
+    private static readonly SNOW_COUNT = 100000;
+    private static readonly SNOW_AREA = 50;
+    private static readonly SNOW_HEIGHT_RANGE = 30;
+    private static readonly SNOW_SPEED = 2.3;
+    private lightningTimer = 0;
+    private lightningFlash = 0;
+    private lastRenderTime = -1;
 
     // Third-person player
     private playerMesh: THREE.Group | null = null;
     private playerPos = { x: 0, y: 0 }; // 2D world position (game units)
     private playerAngle = 0;             // facing direction (radians, smoothed)
-    private thirdPerson = false;         // camera mode flag
+    private thirdPerson = true;
     private keysDown = new Set<string>();
     private keyHandler: ((e: KeyboardEvent) => void) | null = null;
     private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
-    // Camera orbit controlled by mouse
-    private cameraYaw = 0;               // horizontal orbit angle (radians)
-    private cameraPitch = 0.4;           // vertical angle (radians, 0 = horizontal)
-    private cameraDistance = 1.8;        // distance from player
+    // Camera rig — over-the-shoulder TPS
+    private cameraYaw = 0;               // horizontal angle (mouse-controlled)
+    private cameraPitch = 0.12;          // vertical angle (radians, 0 = horizontal)
     private mouseMoveHandler: ((e: MouseEvent) => void) | null = null;
     private pointerLockHandler: (() => void) | null = null;
-    private static readonly PLAYER_SPEED = 2; // game units per second
-    private static readonly MOUSE_SENSITIVITY = 0.001;
-    // Smoothed camera follow target — prevents bobbing & shift on direction changes
-    private cameraFollowTarget = new THREE.Vector3();
-    private cameraFollowInit = false;
+    private static readonly PLAYER_SPEED = 0.25;
+    private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
+    private static readonly MOUSE_SENSITIVITY = 0.00035;
+    // Camera rig parameters
+    private static readonly CAM_TARGET_HEIGHT = 0.28;
+    private static readonly CAM_BACK = 0.55;
+    private static readonly CAM_UP = 0.16;
+    private static readonly CAM_SHOULDER = 0.255;
+    private shoulderSide = 1;
+    private smoothShoulder = 1;
+    // Smoothing half-lives (seconds) — lower = snappier
+    private static readonly HL_CAM_POS = 0.01;
+    private static readonly HL_CAM_Y = 0.01;
+    private static readonly HL_MESH_POS = 0.10;
+    private static readonly HL_MESH_Y = 0.16;
+    private static readonly HL_MESH_ROT = 0.08;
+    private static readonly GAMEPAD_DEADZONE = 0.15;
+    private static readonly GAMEPAD_CAM_SENSITIVITY = 2.5;
+    // Smoothed camera state
+    private smoothCamPos = new THREE.Vector3();
+    private smoothTargetPos = new THREE.Vector3();
+    // Smoothed mesh state (character follows pivot independently)
+    private smoothMeshPos = new THREE.Vector3();
+    private smoothMeshAngle = 0;
+    private cameraInited = false;
+
+    // Interaction system
+    private static readonly INTERACT_RANGE = 6;
+    private static readonly PICK_DURATION_FRUIT = 0.6;
+    private static readonly PICK_DURATION_BUSH = 1.5;
+    private static readonly PICK_DURATION_TREE = 4.0;
+    private static readonly PICK_DURATION_HERB = 0.8;
+    private static readonly TREE_IDS = new Set(['oak', 'pine', 'birch', 'willow', 'apple', 'cherry']);
+    private static readonly BUSH_IDS = new Set(['raspberry', 'mushroom']);
+    private static readonly HERB_IDS = new Set(['wheat', 'wildflower', 'thyme', 'sage', 'reed']);
+    private interactTarget: { id: string; type: 'fruit' | 'plant'; pos3: THREE.Vector3; pickDuration: number; label: string } | null = null;
+    private pickProgress = 0;
+    private picking = false;
+    private interactCanvas: HTMLCanvasElement | null = null;
+    private eKeyWasDown = false;
+    private interactOutline: THREE.Mesh | null = null;
 
     init(container: HTMLElement): void {
         this.container = container;
@@ -380,6 +451,7 @@ class ThreeRenderer implements GameRenderer {
         this.controls.minDistance = 5;
         this.controls.maxDistance = 150;
         this.controls.target.set(0, 0, 0);
+        this.controls.enabled = !this.thirdPerson;
 
         // --- Lights ---
         const ambient = new THREE.AmbientLight(0xffffff, 0.5);
@@ -398,6 +470,33 @@ class ThreeRenderer implements GameRenderer {
         this.sunLight.shadow.camera.bottom = -80;
         this.threeScene.add(this.sunLight);
 
+        // --- Ground detail textures ---
+        this.loadGroundDetailTextures();
+
+        // --- Weather particle systems ---
+        this.initRainParticles();
+        this.initSnowParticles();
+
+        // --- Ocean plane (static, large enough to never see edges) ---
+        const oceanGeo = new THREE.PlaneGeometry(10000, 10000);
+        const oceanLoader = new THREE.TextureLoader();
+        const oceanTex = oceanLoader.load('/textures/ground/water.png');
+        oceanTex.wrapS = oceanTex.wrapT = THREE.RepeatWrapping;
+        oceanTex.repeat.set(4000, 4000);
+        oceanTex.minFilter = THREE.LinearMipmapLinearFilter;
+        oceanTex.magFilter = THREE.LinearFilter;
+        const oceanMat = new THREE.MeshLambertMaterial({
+            map: oceanTex,
+            color: 0x3388bb,
+            transparent: true,
+            opacity: 0.88,
+        });
+        this.oceanMesh = new THREE.Mesh(oceanGeo, oceanMat);
+        this.oceanMesh.rotation.x = -Math.PI / 2;
+        this.oceanMesh.position.y = SEA_LEVEL * SCALE;
+        this.oceanMesh.receiveShadow = false;
+        this.threeScene.add(this.oceanMesh);
+
         // --- Ground ---
         const groundGeo = new THREE.PlaneGeometry(400, 400);
         const groundMat = new THREE.MeshLambertMaterial({ color: 0x3a7d44 });
@@ -415,14 +514,51 @@ class ThreeRenderer implements GameRenderer {
         this.highlightMesh.visible = false;
         this.threeScene.add(this.highlightMesh);
 
+        // --- Interaction outline mesh ---
+        const outGeo = new THREE.RingGeometry(0.12, 0.16, 32);
+        const outMat = new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.8,
+        });
+        this.interactOutline = new THREE.Mesh(outGeo, outMat);
+        this.interactOutline.rotation.x = -Math.PI / 2;
+        this.interactOutline.visible = false;
+        this.threeScene.add(this.interactOutline);
+
         // --- Player mesh (third-person) ---
         this.playerMesh = createMinecraftCharacter('#e74c3c', 'adult');
         this.playerMesh.scale.setScalar(0.25);
         this.playerMesh.visible = false;
         this.threeScene.add(this.playerMesh);
 
+        // --- Tree textures ---
+        for (const name of ['oak', 'birch', 'pine'] as const) {
+            const tLoader = new THREE.TextureLoader();
+            const tex = tLoader.load(`/textures/${name}-trunk.png`);
+            tex.wrapS = THREE.RepeatWrapping;
+            tex.wrapT = THREE.RepeatWrapping;
+            tex.repeat.set(1, 2);
+            this.trunkTextures.set(name, tex);
+        }
+        for (const name of ['oak', 'pine'] as const) {
+            const fLoader = new THREE.TextureLoader();
+            const tex = fLoader.load(`/textures/${name}.png`);
+            tex.wrapS = THREE.RepeatWrapping;
+            tex.wrapT = THREE.RepeatWrapping;
+            tex.repeat.set(5, 5);
+            this.foliageTextures.set(name, tex);
+        }
+
         // --- Keyboard handlers ---
-        this.keyHandler = (e: KeyboardEvent) => this.keysDown.add(e.key.toLowerCase());
+        this.keyHandler = (e: KeyboardEvent) => {
+            const k = e.key.toLowerCase();
+            this.keysDown.add(k);
+            if (k === 'x' && this.thirdPerson) {
+                this.shoulderSide *= -1;
+            }
+        };
         this.keyUpHandler = (e: KeyboardEvent) => this.keysDown.delete(e.key.toLowerCase());
         window.addEventListener('keydown', this.keyHandler);
         window.addEventListener('keyup', this.keyUpHandler);
@@ -433,8 +569,8 @@ class ThreeRenderer implements GameRenderer {
             if (document.pointerLockElement !== this.renderer!.domElement) return;
             this.cameraYaw -= e.movementX * ThreeRenderer.MOUSE_SENSITIVITY;
             this.cameraPitch += e.movementY * ThreeRenderer.MOUSE_SENSITIVITY;
-            // Clamp pitch to avoid flipping
-            this.cameraPitch = Math.max(-0.2, Math.min(1.2, this.cameraPitch));
+            // Clamp pitch: slightly below horizontal to almost overhead
+            this.cameraPitch = Math.max(-1.2, Math.min(1.3, this.cameraPitch));
         };
         document.addEventListener('mousemove', this.mouseMoveHandler);
 
@@ -445,6 +581,16 @@ class ThreeRenderer implements GameRenderer {
             }
         };
         this.renderer.domElement.addEventListener('click', this.pointerLockHandler);
+
+        // Interaction HUD canvas (overlays the 3D renderer)
+        this.interactCanvas = document.createElement('canvas');
+        this.interactCanvas.style.position = 'absolute';
+        this.interactCanvas.style.top = '0';
+        this.interactCanvas.style.left = '0';
+        this.interactCanvas.style.pointerEvents = 'none';
+        this.interactCanvas.style.zIndex = '10';
+        container.style.position = 'relative';
+        container.appendChild(this.interactCanvas);
 
         // Initial resize
         const rect = container.getBoundingClientRect();
@@ -478,9 +624,13 @@ class ThreeRenderer implements GameRenderer {
             this.groundTextureApplied = true;
         }
 
-        // --- Night/day cycle ---
+        // --- Night/day cycle + weather ---
         const { nightFactor } = getCalendar(scene.time);
-        this.updateLighting(nightFactor);
+        this.updateLighting(nightFactor, scene.weather);
+
+        const frameDt = this.lastRenderTime >= 0 ? Math.min(elapsed - this.lastRenderTime, 0.1) : 0;
+        this.lastRenderTime = elapsed;
+        this.updateWeatherEffects(scene, frameDt);
 
         // --- Sync entities ---
         this.syncPlants(scene);
@@ -504,6 +654,9 @@ class ThreeRenderer implements GameRenderer {
             this.controls.update();
         }
         this.renderer.render(this.threeScene, this.threeCamera);
+
+        // --- Interaction HUD (drawn AFTER 3D render) ---
+        this.updateInteraction(scene, frameDt);
     }
 
     resize(width: number, height: number): void {
@@ -513,6 +666,12 @@ class ThreeRenderer implements GameRenderer {
         this.renderer.setPixelRatio(dpr);
         this.threeCamera.aspect = width / height;
         this.threeCamera.updateProjectionMatrix();
+        if (this.interactCanvas) {
+            this.interactCanvas.width = width * dpr;
+            this.interactCanvas.height = height * dpr;
+            this.interactCanvas.style.width = `${width}px`;
+            this.interactCanvas.style.height = `${height}px`;
+        }
     }
 
     /** Toggle third-person mode on/off. Returns the new state. */
@@ -531,6 +690,32 @@ class ThreeRenderer implements GameRenderer {
         return this.thirdPerson;
     }
 
+    /** Half-life smoothing: alpha = 1 - exp(-ln2 * dt / halfLife).
+     *  Frame-rate independent, critically-damped feel. */
+    private static hlAlpha(dt: number, halfLife: number): number {
+        return 1 - Math.exp(-0.693147 * dt / halfLife);
+    }
+
+    private pollGamepad(): { leftX: number; leftY: number; rightX: number; rightY: number; sprint: boolean } {
+        const gamepads = navigator.getGamepads();
+        for (const gp of gamepads) {
+            if (!gp) continue;
+            const dz = ThreeRenderer.GAMEPAD_DEADZONE;
+            const apply = (v: number) => {
+                if (Math.abs(v) < dz) return 0;
+                return (v - Math.sign(v) * dz) / (1 - dz);
+            };
+            return {
+                leftX: apply(gp.axes[0] ?? 0),
+                leftY: apply(gp.axes[1] ?? 0),
+                rightX: apply(gp.axes[2] ?? 0),
+                rightY: apply(gp.axes[3] ?? 0),
+                sprint: gp.buttons[10]?.pressed ?? false,
+            };
+        }
+        return { leftX: 0, leftY: 0, rightX: 0, rightY: 0, sprint: false };
+    }
+
     private updatePlayer(_scene: Scene, elapsed: number) {
         if (!this.playerMesh || !this.threeCamera) return;
 
@@ -542,82 +727,412 @@ class ThreeRenderer implements GameRenderer {
         this.playerMesh.visible = true;
 
         const dt = this.clock.getDelta() || 1 / 60;
-        const speed = ThreeRenderer.PLAYER_SPEED;
+        const gp = this.pollGamepad();
+        const sprinting = this.keysDown.has('shift') || gp.sprint;
+        const speed = ThreeRenderer.PLAYER_SPEED * (sprinting ? ThreeRenderer.PLAYER_SPRINT_MULT : 1);
 
-        // --- Forward / right derived from camera yaw (mouse-controlled) ---
-        const fwdX = Math.sin(this.cameraYaw);
-        const fwdZ = Math.cos(this.cameraYaw);
-        const rightX = -Math.cos(this.cameraYaw);
-        const rightZ = Math.sin(this.cameraYaw);
+        // =============================================
+        //  1) INPUT — camera-relative movement direction
+        // =============================================
+        const sinYaw = Math.sin(this.cameraYaw);
+        const cosYaw = Math.cos(this.cameraYaw);
+        const fwdX = sinYaw;
+        const fwdZ = cosYaw;
+        const rightX = -cosYaw;
+        const rightZ = sinYaw;
 
-        // --- Keyboard input → movement relative to camera direction ---
-        let moveX = 0, moveZ = 0;
+        let inputFwd = 0, inputRight = 0;
         const keys = this.keysDown;
-        if (keys.has('z') || keys.has('w') || keys.has('arrowup')) { moveX += fwdX; moveZ += fwdZ; }
-        if (keys.has('s') || keys.has('arrowdown')) { moveX -= fwdX; moveZ -= fwdZ; }
-        if (keys.has('q') || keys.has('a') || keys.has('arrowleft')) { moveX -= rightX; moveZ -= rightZ; }
-        if (keys.has('d') || keys.has('arrowright')) { moveX += rightX; moveZ += rightZ; }
+        if (keys.has('z') || keys.has('w') || keys.has('arrowup')) inputFwd += 1;
+        if (keys.has('s') || keys.has('arrowdown')) inputFwd -= 1;
+        if (keys.has('q') || keys.has('a') || keys.has('arrowleft')) inputRight -= 1;
+        if (keys.has('d') || keys.has('arrowright')) inputRight += 1;
 
+        inputFwd -= gp.leftY;
+        inputRight += gp.leftX;
+
+        this.cameraYaw -= gp.rightX * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
+        this.cameraPitch += gp.rightY * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
+        this.cameraPitch = Math.max(-1.2, Math.min(1.3, this.cameraPitch));
+
+        let moveX = fwdX * inputFwd + rightX * inputRight;
+        let moveZ = fwdZ * inputFwd + rightZ * inputRight;
         const moving = moveX !== 0 || moveZ !== 0;
 
         if (moving) {
             const len = Math.sqrt(moveX * moveX + moveZ * moveZ);
             moveX /= len;
             moveZ /= len;
+        }
 
-            // Update game-space position
+        // =============================================
+        //  2) PIVOT — the logical point the camera orbits around
+        //     Input moves this instantly. Everything else follows.
+        // =============================================
+        if (moving) {
             this.playerPos.x += (moveX / SCALE) * speed * dt;
             this.playerPos.y += (moveZ / SCALE) * speed * dt;
         }
+        const pivotW = toWorld(this.playerPos);
 
-        // --- Character always faces camera direction (smooth) ---
-        const targetAngle = this.cameraYaw;
-        let diff = targetAngle - this.playerAngle;
-        if (diff > Math.PI) diff -= Math.PI * 2;
-        if (diff < -Math.PI) diff += Math.PI * 2;
-        const rotLerp = 1 - Math.pow(0.00001, dt); // very fast, frame-rate independent
-        this.playerAngle += diff * rotLerp;
-
-        // --- Position on terrain ---
-        const pos = toWorld(this.playerPos);
-        this.playerMesh.position.set(pos.x, pos.y, pos.z);
-        this.playerMesh.rotation.y = this.playerAngle;
-
-        // Walk animation
-        animateWalk(this.playerMesh, elapsed, moving);
-
-        // --- Smooth camera follow target ---
-        // Separate lerp rates: XZ fast, Y very slow (prevents terrain bobbing)
-        const headY = pos.y + 0.4;
-        if (!this.cameraFollowInit) {
-            this.cameraFollowTarget.set(pos.x, headY, pos.z);
-            this.cameraFollowInit = true;
+        // =============================================
+        //  3) CHARACTER MESH — smoothly follows the pivot
+        //     Has its own position + rotation interpolation.
+        //     This creates the organic "character catches up" feel.
+        // =============================================
+        if (!this.cameraInited) {
+            this.smoothMeshPos.set(pivotW.x, pivotW.y, pivotW.z);
+            this.smoothMeshAngle = this.cameraYaw;
         } else {
-            const lerpXZ = 1 - Math.pow(0.001, dt); // fast XZ follow (~0.93 at 60fps)
-            const lerpY = 1 - Math.pow(0.05, dt);  // slow Y follow (~0.25 at 60fps) — kills bobbing
-            this.cameraFollowTarget.x += (pos.x - this.cameraFollowTarget.x) * lerpXZ;
-            this.cameraFollowTarget.z += (pos.z - this.cameraFollowTarget.z) * lerpXZ;
-            this.cameraFollowTarget.y += (headY - this.cameraFollowTarget.y) * lerpY;
+            const meshAlphaXZ = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_POS);
+            const meshAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_Y);
+            this.smoothMeshPos.x += (pivotW.x - this.smoothMeshPos.x) * meshAlphaXZ;
+            this.smoothMeshPos.z += (pivotW.z - this.smoothMeshPos.z) * meshAlphaXZ;
+            this.smoothMeshPos.y += (pivotW.y - this.smoothMeshPos.y) * meshAlphaY;
         }
 
-        const pivot = this.cameraFollowTarget;
+        if (moving) {
+            const targetAngle = Math.atan2(moveX, moveZ);
+            let angleDiff = targetAngle - this.smoothMeshAngle;
+            if (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            if (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+            const rotAlpha = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_ROT);
+            this.smoothMeshAngle += angleDiff * rotAlpha;
+        }
 
-        // --- Camera orbits smoothed pivot via mouse yaw/pitch ---
-        const dist = this.cameraDistance;
+        this.playerMesh.position.copy(this.smoothMeshPos);
+        this.playerMesh.rotation.y = this.smoothMeshAngle;
+        animateWalk(this.playerMesh, elapsed, moving, sprinting);
+
+        // =============================================
+        //  4) CAMERA TARGET — smoothly follows the pivot
+        //     Separate from the mesh so camera doesn't jitter
+        //     when the character catches up.
+        // =============================================
+        const rawTargetX = pivotW.x;
+        const rawTargetY = pivotW.y + ThreeRenderer.CAM_TARGET_HEIGHT;
+        const rawTargetZ = pivotW.z;
+
+        const camTgtAlpha = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_POS);
+        const camTgtAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_Y);
+
+        if (!this.cameraInited) {
+            this.smoothTargetPos.set(rawTargetX, rawTargetY, rawTargetZ);
+            this.smoothCamPos.set(
+                rawTargetX - sinYaw * ThreeRenderer.CAM_BACK,
+                rawTargetY + ThreeRenderer.CAM_UP + Math.sin(this.cameraPitch) * ThreeRenderer.CAM_BACK,
+                rawTargetZ - cosYaw * ThreeRenderer.CAM_BACK
+            );
+            this.cameraInited = true;
+        } else {
+            this.smoothTargetPos.x += (rawTargetX - this.smoothTargetPos.x) * camTgtAlpha;
+            this.smoothTargetPos.z += (rawTargetZ - this.smoothTargetPos.z) * camTgtAlpha;
+            this.smoothTargetPos.y += (rawTargetY - this.smoothTargetPos.y) * camTgtAlphaY;
+        }
+
+        const target = this.smoothTargetPos;
+
+        // =============================================
+        //  5) CAMERA POSITION — orbits around the smoothed target
+        // =============================================
         const cosPitch = Math.cos(this.cameraPitch);
         const sinPitch = Math.sin(this.cameraPitch);
-        const targetCamX = pivot.x - Math.sin(this.cameraYaw) * cosPitch * dist;
-        const targetCamY = pivot.y + sinPitch * dist;
-        const targetCamZ = pivot.z - Math.cos(this.cameraYaw) * cosPitch * dist;
 
-        // Smooth camera position (frame-rate independent)
-        const camLerp = 1 - Math.pow(0.0001, dt); // very responsive (~0.97 at 60fps)
-        this.threeCamera.position.x += (targetCamX - this.threeCamera.position.x) * camLerp;
-        this.threeCamera.position.y += (targetCamY - this.threeCamera.position.y) * camLerp;
-        this.threeCamera.position.z += (targetCamZ - this.threeCamera.position.z) * camLerp;
+        const orbX = -sinYaw * cosPitch * ThreeRenderer.CAM_BACK;
+        const orbY = sinPitch * ThreeRenderer.CAM_BACK + ThreeRenderer.CAM_UP;
+        const orbZ = -cosYaw * cosPitch * ThreeRenderer.CAM_BACK;
 
-        // Look at smoothed pivot (not raw player pos)
-        this.threeCamera.lookAt(pivot);
+        const shoulderAlpha = ThreeRenderer.hlAlpha(dt, 0.12);
+        this.smoothShoulder += (this.shoulderSide - this.smoothShoulder) * shoulderAlpha;
+        const shoulder = ThreeRenderer.CAM_SHOULDER * this.smoothShoulder;
+        const shoulderX = -cosYaw * shoulder;
+        const shoulderZ = sinYaw * shoulder;
+
+        const desiredCamX = target.x + orbX + shoulderX;
+        const desiredCamY = target.y + orbY;
+        const desiredCamZ = target.z + orbZ + shoulderZ;
+
+        const camAlphaXZ = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_POS);
+        const camAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_Y);
+        this.smoothCamPos.x += (desiredCamX - this.smoothCamPos.x) * camAlphaXZ;
+        this.smoothCamPos.z += (desiredCamZ - this.smoothCamPos.z) * camAlphaXZ;
+        this.smoothCamPos.y += (desiredCamY - this.smoothCamPos.y) * camAlphaY;
+
+        const camGround = toWorld({
+            x: this.smoothCamPos.x / SCALE,
+            y: this.smoothCamPos.z / SCALE,
+        });
+        const minCamY = camGround.y + 0.08;
+        if (this.smoothCamPos.y < minCamY) {
+            this.smoothCamPos.y = minCamY;
+        }
+
+        this.threeCamera.position.copy(this.smoothCamPos);
+
+        // =============================================
+        //  6) LOOK-AT — offset by the same shoulder so it's a parallel shift
+        // =============================================
+        this.threeCamera.lookAt(
+            target.x + shoulderX,
+            target.y,
+            target.z + shoulderZ,
+        );
+    }
+
+    // =============================================================
+    //  INTERACTION SYSTEM — [E] prompt + radial pick progress
+    // =============================================================
+
+    private updateInteraction(scene: Scene, dt: number) {
+        if (!this.thirdPerson || !this.threeCamera || !this.interactCanvas) {
+            if (this.interactCanvas) {
+                const ctx2 = this.interactCanvas.getContext('2d');
+                if (ctx2) ctx2.clearRect(0, 0, this.interactCanvas.width, this.interactCanvas.height);
+            }
+            this.interactTarget = null;
+            this.pickProgress = 0;
+            this.picking = false;
+            return;
+        }
+
+        const MAX_RAY_DIST = ThreeRenderer.INTERACT_RANGE * SCALE;
+        const MAX_CROSS_DIST = 0.15;
+
+        const rayOrigin = this.threeCamera.position.clone();
+        const rayDir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.threeCamera.quaternion).normalize();
+
+        let bestScore = Infinity;
+        let bestEntity: { id: string; type: 'fruit' | 'plant'; pos: { x: number; y: number }; pickDuration: number; label: string } | null = null;
+
+        const _diff = new THREE.Vector3();
+        const _cross = new THREE.Vector3();
+
+        for (const e of scene.entities) {
+            if (e.type !== 'fruit' && e.type !== 'plant') continue;
+            if (e.type === 'plant' && e.growth < 0.3) continue;
+
+            let ep: THREE.Vector3;
+            if (e.type === 'fruit') {
+                const rp = this.fruitRenderedPos.get(e.id);
+                if (rp) {
+                    ep = new THREE.Vector3(rp.x, rp.y, rp.z);
+                } else {
+                    const ew = toWorld(e.position);
+                    ep = new THREE.Vector3(ew.x, ew.y, ew.z);
+                }
+            } else {
+                const ew = toWorld(e.position);
+                const sp = getSpecies(e.speciesId);
+                const h = sp ? sp.maxSize * SCALE * 0.3 : 0.2;
+                ep = new THREE.Vector3(ew.x, ew.y + h, ew.z);
+            }
+
+            _diff.subVectors(ep, rayOrigin);
+            const along = _diff.dot(rayDir);
+            if (along < 0 || along > MAX_RAY_DIST) continue;
+
+            _cross.copy(_diff).addScaledVector(rayDir, -along);
+            const crossDist = _cross.length();
+
+            const hitRadius = e.type === 'fruit' ? MAX_CROSS_DIST * 0.6 : MAX_CROSS_DIST;
+            if (crossDist > hitRadius) continue;
+
+            const score = along + crossDist * 3;
+            if (score < bestScore) {
+                bestScore = score;
+                let label: string;
+                let pickDuration: number;
+                if (e.type === 'fruit') {
+                    label = (e as FruitEntity).fruitName;
+                    pickDuration = ThreeRenderer.PICK_DURATION_FRUIT;
+                } else {
+                    const sp = getSpecies(e.speciesId);
+                    label = sp ? sp.displayName : e.speciesId;
+                    const sid = e.speciesId;
+                    if (ThreeRenderer.TREE_IDS.has(sid)) {
+                        pickDuration = ThreeRenderer.PICK_DURATION_TREE;
+                    } else if (ThreeRenderer.BUSH_IDS.has(sid)) {
+                        pickDuration = ThreeRenderer.PICK_DURATION_BUSH;
+                    } else {
+                        pickDuration = ThreeRenderer.PICK_DURATION_HERB;
+                    }
+                }
+                bestEntity = {
+                    id: e.id,
+                    type: e.type as 'fruit' | 'plant',
+                    pos: e.position,
+                    pickDuration,
+                    label,
+                };
+            }
+        }
+
+        if (!bestEntity) {
+            this.interactTarget = null;
+            this.pickProgress = 0;
+            this.picking = false;
+        } else {
+            let targetPos: THREE.Vector3;
+            if (bestEntity.type === 'fruit') {
+                const rp = this.fruitRenderedPos.get(bestEntity.id);
+                if (rp) {
+                    targetPos = new THREE.Vector3(rp.x, rp.y + 0.04, rp.z);
+                } else {
+                    const w3 = toWorld(bestEntity.pos);
+                    targetPos = new THREE.Vector3(w3.x, w3.y + 0.06, w3.z);
+                }
+            } else {
+                const w3 = toWorld(bestEntity.pos);
+                let plantH = 0.18;
+                const pe = scene.entities.find(en => en.id === bestEntity!.id) as PlantEntity | undefined;
+                if (pe && ThreeRenderer.TREE_IDS.has(pe.speciesId)) {
+                    plantH = 0.4;
+                }
+                targetPos = new THREE.Vector3(w3.x, w3.y + plantH, w3.z);
+            }
+
+            if (!this.interactTarget || this.interactTarget.id !== bestEntity.id) {
+                this.pickProgress = 0;
+                this.picking = false;
+            }
+            this.interactTarget = {
+                id: bestEntity.id,
+                type: bestEntity.type,
+                pos3: targetPos,
+                pickDuration: bestEntity.pickDuration,
+                label: bestEntity.label,
+            };
+        }
+
+        const eDown = this.keysDown.has('e');
+        if (this.interactTarget && eDown) {
+            this.picking = true;
+            this.pickProgress += dt / this.interactTarget.pickDuration;
+            if (this.pickProgress >= 1) {
+                const idx = scene.entities.findIndex(en => en.id === this.interactTarget!.id);
+                if (idx >= 0) scene.entities.splice(idx, 1);
+                this.interactTarget = null;
+                this.pickProgress = 0;
+                this.picking = false;
+            }
+        } else {
+            if (!eDown && this.picking) {
+                this.pickProgress = 0;
+                this.picking = false;
+            }
+        }
+
+        if (this.interactOutline) {
+            if (this.interactTarget) {
+                this.interactOutline.visible = true;
+                const t = this.interactTarget;
+                let outlineScale = 2.5;
+                let yOff = 0.15;
+                if (t.type === 'fruit') {
+                    outlineScale = 0.6;
+                    yOff = 0.04;
+                } else {
+                    const pe = scene.entities.find(en => en.id === t.id) as PlantEntity | undefined;
+                    if (pe && ThreeRenderer.TREE_IDS.has(pe.speciesId)) {
+                        outlineScale = 5.0;
+                        yOff = 0.35;
+                    } else if (pe && ThreeRenderer.HERB_IDS.has(pe.speciesId)) {
+                        outlineScale = 1.5;
+                        yOff = 0.08;
+                    }
+                }
+                this.interactOutline.position.set(t.pos3.x, t.pos3.y - yOff, t.pos3.z);
+                this.interactOutline.scale.setScalar(outlineScale);
+                const pulse = 0.7 + 0.3 * Math.sin(performance.now() * 0.005);
+                (this.interactOutline.material as THREE.MeshBasicMaterial).opacity = pulse * 0.8;
+            } else {
+                this.interactOutline.visible = false;
+            }
+        }
+
+        this.drawInteractHUD();
+    }
+
+    private drawInteractHUD() {
+        const canvas = this.interactCanvas;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (this.thirdPerson) {
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            const cx = canvas.width / 2;
+            const cy = canvas.height / 2;
+            const dotR = 2.5 * dpr;
+            ctx.beginPath();
+            ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(cx, cy, dotR + 1 * dpr, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+            ctx.lineWidth = 0.8 * dpr;
+            ctx.stroke();
+        }
+
+        if (!this.interactTarget || !this.threeCamera) return;
+
+        const projected = this.interactTarget.pos3.clone().project(this.threeCamera);
+        if (projected.z > 1) return;
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const cx = (projected.x * 0.5 + 0.5) * canvas.width / dpr;
+        const cy = (-projected.y * 0.5 + 0.5) * canvas.height / dpr;
+
+        const screenX = cx * dpr;
+        const screenY = cy * dpr;
+        const radius = 16 * dpr;
+        const lineW = 2.5 * dpr;
+        const fontSize = 13 * dpr;
+
+        ctx.save();
+        ctx.translate(screenX, screenY);
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fill();
+
+        ctx.font = `${fontSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('E', 0, 0.5 * dpr);
+
+        if (this.picking && this.pickProgress > 0) {
+            const startAngle = -Math.PI / 2;
+            const endAngle = startAngle + Math.PI * 2 * Math.min(this.pickProgress, 1);
+
+            ctx.beginPath();
+            ctx.arc(0, 0, radius + lineW * 0.5, startAngle, endAngle);
+            ctx.strokeStyle = '#4cff4c';
+            ctx.lineWidth = lineW;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        } else {
+            ctx.beginPath();
+            ctx.arc(0, 0, radius + lineW * 0.5, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.lineWidth = lineW * 0.4;
+            ctx.stroke();
+        }
+
+        const label = this.interactTarget.label;
+        ctx.font = `${fontSize * 0.8}px sans-serif`;
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = 'rgba(0,0,0,0.9)';
+        ctx.shadowBlur = 3 * dpr;
+        ctx.fillText(label, 0, radius + fontSize * 0.9);
+        ctx.shadowBlur = 0;
+
+        ctx.restore();
     }
 
     destroy(): void {
@@ -638,6 +1153,18 @@ class ThreeRenderer implements GameRenderer {
         if (this.playerMesh) this.disposeObject(this.playerMesh);
         this.playerMesh = null;
 
+        // Dispose interaction canvas + outline
+        if (this.interactCanvas) {
+            this.interactCanvas.remove();
+            this.interactCanvas = null;
+        }
+        if (this.interactOutline) {
+            this.threeScene?.remove(this.interactOutline);
+            this.interactOutline.geometry.dispose();
+            (this.interactOutline.material as THREE.Material).dispose();
+            this.interactOutline = null;
+        }
+
         // Dispose all meshes
         this.npcMeshes.forEach((m) => this.disposeObject(m));
         this.buildingMeshes.forEach((m) => this.disposeObject(m));
@@ -656,6 +1183,10 @@ class ThreeRenderer implements GameRenderer {
             for (const p of parts) { p.geo.dispose(); p.mat.dispose(); }
         }
         this.plantPartCache.clear();
+        for (const tex of this.trunkTextures.values()) tex.dispose();
+        this.trunkTextures.clear();
+        for (const tex of this.foliageTextures.values()) tex.dispose();
+        this.foliageTextures.clear();
         // Dispose instanced fruit meshes
         for (const inst of this.fruitInstances.values()) {
             this.threeScene?.remove(inst);
@@ -677,14 +1208,45 @@ class ThreeRenderer implements GameRenderer {
         for (const chunk of this.grassChunks.values()) {
             this.threeScene?.remove(chunk.instA);
             this.threeScene?.remove(chunk.instB);
+            this.threeScene?.remove(chunk.instC);
             chunk.instA.dispose();
             chunk.instB.dispose();
+            chunk.instC.dispose();
         }
         this.grassChunks.clear();
         if (this.grassPlaneGeo) { this.grassPlaneGeo.dispose(); this.grassPlaneGeo = null; }
         if (this.grassMat) { this.grassMat.dispose(); this.grassMat = null; }
 
-        // Dispose water mesh
+        // Dispose rain mesh
+        if (this.rainMesh) {
+            this.threeScene?.remove(this.rainMesh);
+            this.rainMesh.geometry.dispose();
+            (this.rainMesh.material as THREE.LineBasicMaterial).dispose();
+            this.rainMesh = null;
+        }
+        this.rainPositions = null;
+
+        // Dispose snow mesh
+        if (this.snowMesh) {
+            this.threeScene?.remove(this.snowMesh);
+            this.snowMesh.geometry.dispose();
+            (this.snowMesh.material as THREE.PointsMaterial).dispose();
+            this.snowMesh = null;
+        }
+        this.snowPositions = null;
+
+        // Dispose splatmap resources
+        if (this.groundSplatMat) { this.groundSplatMat.dispose(); this.groundSplatMat = null; }
+        if (this.groundOverlayMat) { this.groundOverlayMat.dispose(); this.groundOverlayMat = null; }
+        if (this.splatTexture) { this.splatTexture.dispose(); this.splatTexture = null; }
+        if (this.grassDetailTex) { this.grassDetailTex.dispose(); this.grassDetailTex = null; }
+        if (this.dirtDetailTex) { this.dirtDetailTex.dispose(); this.dirtDetailTex = null; }
+        this.splatCanvas = null;
+        this.groundSplatShaderRef = null;
+
+        if (this.oceanMesh) this.disposeObject(this.oceanMesh);
+        this.oceanMesh = null;
+
         if (this.waterMesh) this.disposeObject(this.waterMesh);
         this.waterMesh = null;
         this.waterGeometry = null;
@@ -741,72 +1303,114 @@ class ThreeRenderer implements GameRenderer {
         grassTex.minFilter = THREE.LinearMipmapLinearFilter;
         this.grassMat = new THREE.MeshLambertMaterial({
             map: grassTex,
-            transparent: true,
-            alphaTest: 0.3,
+            alphaTest: 0.35,
             side: THREE.DoubleSide,
-            depthWrite: false,
         });
+
+        const fadeStart = ThreeRenderer.GRASS_RENDER_RADIUS * SCALE * 0.55;
+        const fadeEnd = ThreeRenderer.GRASS_RENDER_RADIUS * SCALE * 0.92;
+
+        this.grassMat.onBeforeCompile = (shader) => {
+            shader.uniforms.uFadeStart = { value: fadeStart };
+            shader.uniforms.uFadeEnd = { value: fadeEnd };
+
+            shader.vertexShader = shader.vertexShader.replace(
+                'void main() {',
+                'varying float vGrassDist;\nvoid main() {'
+            );
+            shader.vertexShader = shader.vertexShader.replace(
+                '#include <fog_vertex>',
+                '#include <fog_vertex>\nvGrassDist = -mvPosition.z;'
+            );
+
+            shader.fragmentShader = shader.fragmentShader.replace(
+                'void main() {',
+                'varying float vGrassDist;\nuniform float uFadeStart;\nuniform float uFadeEnd;\nvoid main() {'
+            );
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <alphatest_fragment>',
+                'diffuseColor.a *= smoothstep(uFadeEnd, uFadeStart, vGrassDist);\n#include <alphatest_fragment>'
+            );
+        };
+
         this.grassPlaneGeo = new THREE.PlaneGeometry(0.8, 0.8);
         this.grassPlaneGeo.translate(0, 0.4, 0);
     }
 
-    /** Build a single grass chunk at chunk grid coords (cx, cz) */
     private buildGrassChunk(
         cx: number, cz: number,
         soilGrid: SoilGrid, heightMap: HeightMap,
-        camWX: number, camWZ: number,
-    ): { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh } | null {
+        lod: number,
+        basinMap?: BasinMap | null,
+    ): { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number } | null {
         const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
-        const STEP = ThreeRenderer.GRASS_STEP;
-        const RADIUS = ThreeRenderer.GRASS_RENDER_RADIUS;
-        const FADE = ThreeRenderer.GRASS_FADE_START;
+        const STEP = lod === 0 ? ThreeRenderer.GRASS_STEP_NEAR : ThreeRenderer.GRASS_STEP_FAR;
+        const SCALE_MULT = lod === 0 ? 1.0 : ThreeRenderer.GRASS_SCALE_FAR;
 
         const worldX0 = cx * CS;
         const worldZ0 = cz * CS;
 
-        // Deterministic seed per chunk for consistent randomness
         const seed = (cx * 73856093) ^ (cz * 19349663);
         let rng = (seed & 0x7fffffff) || 1;
         const rand = () => { rng = (rng * 16807) % 2147483647; return (rng & 0x7fffffff) / 0x7fffffff; };
 
-        type GrassEntry = { x: number; y: number; z: number; scale: number; rot: number };
+        const cols = soilGrid.cols, sRows = soilGrid.rows, csz = soilGrid.cellSize;
+        const ox = soilGrid.originX, oy = soilGrid.originY;
+        const sampleBilinear = (layer: Float32Array, wx: number, wz: number): number => {
+            const fx = (wx - ox) / csz;
+            const fz = (wz - oy) / csz;
+            const x0 = Math.max(0, Math.min(cols - 1, Math.floor(fx)));
+            const z0 = Math.max(0, Math.min(sRows - 1, Math.floor(fz)));
+            const x1 = Math.min(x0 + 1, cols - 1);
+            const z1 = Math.min(z0 + 1, sRows - 1);
+            const tx = Math.max(0, Math.min(1, fx - x0));
+            const tz = Math.max(0, Math.min(1, fz - z0));
+            return (layer[z0 * cols + x0] * (1 - tx) + layer[z0 * cols + x1] * tx) * (1 - tz)
+                + (layer[z1 * cols + x0] * (1 - tx) + layer[z1 * cols + x1] * tx) * tz;
+        };
+
+        const sampleBasin = basinMap ? (wx: number, wz: number): number => {
+            const bfx = (wx - basinMap.originX) / basinMap.cellSize;
+            const bfz = (wz - basinMap.originY) / basinMap.cellSize;
+            const bx0 = Math.max(0, Math.min(basinMap.cols - 1, Math.floor(bfx)));
+            const bz0 = Math.max(0, Math.min(basinMap.rows - 1, Math.floor(bfz)));
+            const bx1 = Math.min(bx0 + 1, basinMap.cols - 1);
+            const bz1 = Math.min(bz0 + 1, basinMap.rows - 1);
+            const btx = Math.max(0, Math.min(1, bfx - bx0));
+            const btz = Math.max(0, Math.min(1, bfz - bz0));
+            return (basinMap.data[bz0 * basinMap.cols + bx0] * (1 - btx) + basinMap.data[bz0 * basinMap.cols + bx1] * btx) * (1 - btz)
+                + (basinMap.data[bz1 * basinMap.cols + bx0] * (1 - btx) + basinMap.data[bz1 * basinMap.cols + bx1] * btx) * btz;
+        } : null;
+
+        type GrassEntry = { x: number; y: number; z: number; scale: number; rot: number; dark: number };
         const entries: GrassEntry[] = [];
 
         for (let lx = 0; lx < CS; lx += STEP) {
             for (let lz = 0; lz < CS; lz += STEP) {
-                const wx = worldX0 + lx + (rand() - 0.5) * STEP * 1.4;
-                const wz = worldZ0 + lz + (rand() - 0.5) * STEP * 1.4;
+                const wx = worldX0 + lx + (rand() - 0.5) * STEP * 1.8;
+                const wz = worldZ0 + lz + (rand() - 0.5) * STEP * 1.8;
 
-                // Soil check
-                const col = Math.floor((wx - soilGrid.originX) / soilGrid.cellSize);
-                const row = Math.floor((wz - soilGrid.originY) / soilGrid.cellSize);
-                if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
-                const idx = row * soilGrid.cols + col;
-                const hum = soilGrid.layers.humidity[idx];
-                const waterLvl = soilGrid.waterLevel[idx];
-                if (waterLvl > 0.1) continue;
-                if (hum < 0.10) continue; // absolute minimum
+                const hum = sampleBilinear(soilGrid.layers.humidity, wx, wz);
+                const waterLvl = sampleBilinear(soilGrid.waterLevel, wx, wz);
+                if (waterLvl > 0.08) continue;
+                if (hum < 0.08) continue;
 
-                // Smooth humidity gradient: density + size taper off gradually
-                const humFactor = Math.min(1, Math.max(0, (hum - 0.10) / 0.40)); // 0→1 over hum 0.10..0.50
-                // Probabilistic density: less humid = fewer patches
-                if (rand() > humFactor * humFactor) continue; // squared for sharper falloff in dry areas
+                const humFactor = Math.min(1, Math.max(0, (hum - 0.08) / 0.40));
+                if (rand() > humFactor * humFactor) continue;
+                if (lod === 1 && rand() < 0.15) continue;
+                if (lod === 0 && rand() < 0.08) continue;
 
-                // Distance fade: shrink grass near edge of render radius
-                const distToCam = Math.sqrt((wx - camWX) ** 2 + (wz - camWZ) ** 2);
-                if (distToCam > RADIUS) continue;
-                const fadeRatio = distToCam / RADIUS;
-                const distFade = fadeRatio > FADE ? 1 - (fadeRatio - FADE) / (1 - FADE) : 1;
-
-                const h = getHeightAt(heightMap, wx, wz) * HEIGHT_SCALE;
-                // Size also scales with humidity — sparse thin grass in dry, lush in wet
-                const humScale = 0.5 + humFactor * 0.5; // 50%–100% size
-                const baseScale = (0.15 + rand() * 0.15) * humScale;
-                const scale = baseScale * distFade;
-                if (scale < 0.02) continue; // too small, skip
+                const rawH = getHeightAt(heightMap, wx, wz);
+                if (rawH < SEA_LEVEL + 2) continue;
+                const h = rawH * HEIGHT_SCALE;
+                const humScale = 0.5 + humFactor * 0.5;
+                const scale = (0.12 + rand() * 0.18) * humScale * SCALE_MULT;
+                if (scale < 0.05) continue;
                 const rot = rand() * Math.PI;
 
-                entries.push({ x: wx * SCALE, y: h, z: wz * SCALE, scale, rot });
+                const basin = sampleBasin ? sampleBasin(wx, wz) : 0;
+                const dark = 1.0 - basin * 0.75;
+                entries.push({ x: wx * SCALE, y: h, z: wz * SCALE, scale, rot, dark });
             }
         }
 
@@ -817,29 +1421,48 @@ class ThreeRenderer implements GameRenderer {
 
         const instA = new THREE.InstancedMesh(this.grassPlaneGeo!, this.grassMat!, count);
         const instB = new THREE.InstancedMesh(this.grassPlaneGeo!, this.grassMat!, count);
+        const instC = new THREE.InstancedMesh(this.grassPlaneGeo!, this.grassMat!, count);
         instA.frustumCulled = false;
         instB.frustumCulled = false;
+        instC.frustumCulled = false;
 
         const rA = new THREE.Quaternion();
         const rB = new THREE.Quaternion();
+        const rC = new THREE.Quaternion();
         const yAxis = new THREE.Vector3(0, 1, 0);
+        const THIRD = Math.PI / 3;
+        const _col = new THREE.Color();
 
         for (let i = 0; i < count; i++) {
             const e = entries[i];
-            rA.setFromAxisAngle(yAxis, e.rot);
             _pos3.set(e.x, e.y, e.z);
             _scl3.set(e.scale, e.scale, e.scale);
+
+            rA.setFromAxisAngle(yAxis, e.rot);
             _mat4.compose(_pos3, rA, _scl3);
             instA.setMatrixAt(i, _mat4);
 
-            rB.setFromAxisAngle(yAxis, e.rot + Math.PI * 0.5);
+            rB.setFromAxisAngle(yAxis, e.rot + THIRD);
             _mat4.compose(_pos3, rB, _scl3);
             instB.setMatrixAt(i, _mat4);
+
+            rC.setFromAxisAngle(yAxis, e.rot + THIRD * 2);
+            _mat4.compose(_pos3, rC, _scl3);
+            instC.setMatrixAt(i, _mat4);
+
+            _col.setScalar(e.dark);
+            instA.setColorAt(i, _col);
+            instB.setColorAt(i, _col);
+            instC.setColorAt(i, _col);
         }
 
         instA.instanceMatrix.needsUpdate = true;
         instB.instanceMatrix.needsUpdate = true;
-        return { instA, instB };
+        instC.instanceMatrix.needsUpdate = true;
+        instA.instanceColor!.needsUpdate = true;
+        instB.instanceColor!.needsUpdate = true;
+        instC.instanceColor!.needsUpdate = true;
+        return { instA, instB, instC, lod };
     }
 
     /** Called each frame — add/remove grass chunks around camera */
@@ -847,7 +1470,6 @@ class ThreeRenderer implements GameRenderer {
         const soilGrid = scene.soilGrid!;
         const heightMap = scene.heightMap!;
 
-        // Camera world position
         let camWX: number, camWZ: number;
         if (this.thirdPerson) {
             camWX = this.playerPos.x;
@@ -857,7 +1479,6 @@ class ThreeRenderer implements GameRenderer {
             camWZ = this.threeCamera!.position.z / SCALE;
         }
 
-        // Only rebuild when camera moved significantly (half a chunk)
         const dx = camWX - this.grassLastCamX;
         const dz = camWZ - this.grassLastCamZ;
         if (dx * dx + dz * dz < (ThreeRenderer.GRASS_CHUNK_SIZE * 0.5) ** 2) return;
@@ -866,45 +1487,56 @@ class ThreeRenderer implements GameRenderer {
 
         const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
         const RADIUS = ThreeRenderer.GRASS_RENDER_RADIUS;
+        const LOD_BOUNDARY = ThreeRenderer.GRASS_LOD_BOUNDARY;
 
-        // Determine which chunks should be visible
         const chunkRadius = Math.ceil(RADIUS / CS);
         const camCX = Math.floor(camWX / CS);
         const camCZ = Math.floor(camWZ / CS);
-        const neededKeys = new Set<string>();
+        const neededChunks = new Map<string, number>();
 
         for (let dcx = -chunkRadius; dcx <= chunkRadius; dcx++) {
             for (let dcz = -chunkRadius; dcz <= chunkRadius; dcz++) {
                 const cx = camCX + dcx;
                 const cz = camCZ + dcz;
-                // Check chunk center distance
                 const chunkCenterX = (cx + 0.5) * CS;
                 const chunkCenterZ = (cz + 0.5) * CS;
                 const dist = Math.sqrt((chunkCenterX - camWX) ** 2 + (chunkCenterZ - camWZ) ** 2);
                 if (dist > RADIUS + CS) continue;
-                neededKeys.add(`${cx},${cz}`);
+                const lod = dist < LOD_BOUNDARY ? 0 : 1;
+                neededChunks.set(`${cx},${cz}`, lod);
             }
         }
 
-        // Remove chunks no longer needed
         for (const [key, chunk] of this.grassChunks) {
-            if (!neededKeys.has(key)) {
+            if (!neededChunks.has(key)) {
                 this.threeScene!.remove(chunk.instA);
                 this.threeScene!.remove(chunk.instB);
+                this.threeScene!.remove(chunk.instC);
                 chunk.instA.dispose();
                 chunk.instB.dispose();
+                chunk.instC.dispose();
                 this.grassChunks.delete(key);
             }
         }
 
-        // Create missing chunks
-        for (const key of neededKeys) {
-            if (this.grassChunks.has(key)) continue;
+        for (const [key, desiredLod] of neededChunks) {
+            const existing = this.grassChunks.get(key);
+            if (existing && existing.lod === desiredLod) continue;
+            if (existing) {
+                this.threeScene!.remove(existing.instA);
+                this.threeScene!.remove(existing.instB);
+                this.threeScene!.remove(existing.instC);
+                existing.instA.dispose();
+                existing.instB.dispose();
+                existing.instC.dispose();
+                this.grassChunks.delete(key);
+            }
             const [cx, cz] = key.split(',').map(Number);
-            const chunk = this.buildGrassChunk(cx, cz, soilGrid, heightMap, camWX, camWZ);
+            const chunk = this.buildGrassChunk(cx, cz, soilGrid, heightMap, desiredLod, scene.basinMap);
             if (chunk) {
                 this.threeScene!.add(chunk.instA);
                 this.threeScene!.add(chunk.instB);
+                this.threeScene!.add(chunk.instC);
                 this.grassChunks.set(key, chunk);
             }
         }
@@ -942,31 +1574,139 @@ class ThreeRenderer implements GameRenderer {
                 mat: new THREE.MeshLambertMaterial({ color: 0x6B5B3A }),
                 offsetY: sz * 0.15,
             });
-        } else if (speciesId === 'oak' || speciesId === 'pine') {
+        } else if (speciesId === 'oak') {
             const trunkH = sz * 0.8;
             const trunkR = sz * 0.08;
+            const oakTrunk = this.trunkTextures.get('oak');
             parts.push({
-                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6),
-                mat: new THREE.MeshLambertMaterial({ color: 0x6B4226 }),
+                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 8),
+                mat: oakTrunk
+                    ? new THREE.MeshLambertMaterial({ map: oakTrunk })
+                    : new THREE.MeshLambertMaterial({ color: 0x6B4226 }),
                 offsetY: trunkH / 2,
             });
-            if (speciesId === 'pine') {
-                const crownH = sz * 1.2;
-                const crownR = sz * 0.45;
-                parts.push({
-                    geo: new THREE.ConeGeometry(crownR, crownH, 8),
-                    mat: new THREE.MeshLambertMaterial({ color: c }),
-                    offsetY: trunkH + crownH * 0.35,
-                });
-            } else {
-                const crownR = sz * 0.55;
-                parts.push({
-                    geo: new THREE.SphereGeometry(crownR, 8, 6),
-                    mat: new THREE.MeshLambertMaterial({ color: c }),
-                    offsetY: trunkH + crownR * 0.3,
-                });
-            }
+            const crownR = sz * 0.55;
+            const oakLeaf = this.foliageTextures.get('oak');
+            parts.push({
+                geo: new THREE.SphereGeometry(crownR, 8, 6),
+                mat: oakLeaf
+                    ? new THREE.MeshLambertMaterial({ map: oakLeaf, color: c })
+                    : new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: trunkH + crownR * 0.3,
+            });
+        } else if (speciesId === 'pine') {
+            const trunkH = sz * 0.8;
+            const trunkR = sz * 0.08;
+            const pineTrunk = this.trunkTextures.get('pine');
+            parts.push({
+                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 8),
+                mat: pineTrunk
+                    ? new THREE.MeshLambertMaterial({ map: pineTrunk })
+                    : new THREE.MeshLambertMaterial({ color: 0x6B4226 }),
+                offsetY: trunkH / 2,
+            });
+            const crownH = sz * 1.2;
+            const crownR = sz * 0.45;
+            const pineLeaf = this.foliageTextures.get('pine');
+            parts.push({
+                geo: new THREE.ConeGeometry(crownR, crownH, 8),
+                mat: pineLeaf
+                    ? new THREE.MeshLambertMaterial({ map: pineLeaf, color: c })
+                    : new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: trunkH + crownH * 0.35,
+            });
+        } else if (speciesId === 'birch') {
+            const trunkH = sz * 0.85;
+            const trunkR = sz * 0.04;
+            const birchTrunk = this.trunkTextures.get('birch');
+            parts.push({
+                geo: new THREE.CylinderGeometry(trunkR * 0.6, trunkR, trunkH, 8),
+                mat: birchTrunk
+                    ? new THREE.MeshLambertMaterial({ map: birchTrunk })
+                    : new THREE.MeshLambertMaterial({ color: 0xE8DCC8 }),
+                offsetY: trunkH / 2,
+            });
+            const crownR = sz * 0.4;
+            const crownGeo = new THREE.SphereGeometry(crownR, 8, 6);
+            crownGeo.scale(0.8, 1.1, 0.8);
+            parts.push({
+                geo: crownGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: trunkH + crownR * 0.2,
+            });
+        } else if (speciesId === 'willow') {
+            // Willow: thick trunk + drooping "umbrella" crown (squashed sphere + hanging cones)
+            const trunkH = sz * 0.7;
+            const trunkR = sz * 0.07;
+            parts.push({
+                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6),
+                mat: new THREE.MeshLambertMaterial({ color: 0x5A4A3A }),
+                offsetY: trunkH / 2,
+            });
+            // Wide, flat canopy
+            const canopyR = sz * 0.6;
+            const canopyGeo = new THREE.SphereGeometry(canopyR, 10, 8);
+            canopyGeo.scale(1.2, 0.5, 1.2);
+            parts.push({
+                geo: canopyGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: trunkH + canopyR * 0.15,
+            });
+            // Hanging branches (inverted cone below canopy)
+            const hangH = sz * 0.5;
+            parts.push({
+                geo: new THREE.ConeGeometry(canopyR * 0.9, hangH, 8),
+                mat: new THREE.MeshLambertMaterial({ color: c, transparent: true, opacity: 0.6 }),
+                offsetY: trunkH - hangH * 0.1,
+            });
+        } else if (speciesId === 'mushroom') {
+            // Mushroom: small cylinder stem + flat half-sphere cap
+            const stemH = sz * 0.4;
+            const stemR = sz * 0.12;
+            parts.push({
+                geo: new THREE.CylinderGeometry(stemR, stemR * 0.8, stemH, 6),
+                mat: new THREE.MeshLambertMaterial({ color: 0xE8DCC0 }),
+                offsetY: stemH / 2,
+            });
+            const capR = sz * 0.5;
+            const capGeo = new THREE.SphereGeometry(capR, 8, 4, 0, Math.PI * 2, 0, Math.PI / 2);
+            parts.push({
+                geo: capGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: stemH,
+            });
+        } else if (speciesId === 'reed') {
+            // Reed: very thin tall cylinder + tiny tuft on top
+            const stalkH = sz * 0.9;
+            parts.push({
+                geo: new THREE.CylinderGeometry(0.008, 0.015, stalkH, 4),
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: stalkH / 2,
+            });
+            const tuftGeo = new THREE.SphereGeometry(sz * 0.08, 5, 4);
+            tuftGeo.scale(0.5, 1.5, 0.5);
+            parts.push({
+                geo: tuftGeo,
+                mat: new THREE.MeshLambertMaterial({ color: 0xB8A880 }),
+                offsetY: stalkH,
+            });
+        } else if (speciesId === 'apple' || speciesId === 'cherry') {
+            // Fruit tree: sturdy trunk + big round crown
+            const trunkH = sz * 0.7;
+            const trunkR = sz * 0.07;
+            parts.push({
+                geo: new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6),
+                mat: new THREE.MeshLambertMaterial({ color: 0x7B5B3A }),
+                offsetY: trunkH / 2,
+            });
+            const crownR = sz * 0.55;
+            parts.push({
+                geo: new THREE.SphereGeometry(crownR, 10, 8),
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: trunkH + crownR * 0.25,
+            });
         } else if (speciesId === 'raspberry') {
+            // Raspberry: bushy sphere, flattened
             const bushR = sz * 0.4;
             const bushGeo = new THREE.SphereGeometry(bushR, 8, 6);
             bushGeo.scale(1, 0.6, 1);
@@ -975,7 +1715,18 @@ class ThreeRenderer implements GameRenderer {
                 mat: new THREE.MeshLambertMaterial({ color: c }),
                 offsetY: sz * 0.3,
             });
+        } else if (speciesId === 'thyme' || speciesId === 'sage') {
+            // Low bush herbs: small flattened sphere
+            const bushR = sz * 0.4;
+            const bushGeo = new THREE.SphereGeometry(bushR, 8, 6);
+            bushGeo.scale(1.2, 0.5, 1.2);
+            parts.push({
+                geo: bushGeo,
+                mat: new THREE.MeshLambertMaterial({ color: c }),
+                offsetY: sz * 0.15,
+            });
         } else if (speciesId === 'wheat') {
+            // Wheat: thin stalk + elongated head
             const stalkH = sz * 0.7;
             parts.push({
                 geo: new THREE.CylinderGeometry(0.01, 0.015, stalkH, 4),
@@ -990,7 +1741,7 @@ class ThreeRenderer implements GameRenderer {
                 offsetY: stalkH,
             });
         } else {
-            // Wildflower / default
+            // Wildflower / default: thin stem + colorful sphere
             const stemH = sz * 0.4;
             parts.push({
                 geo: new THREE.CylinderGeometry(0.01, 0.015, stemH, 4),
@@ -1086,12 +1837,20 @@ class ThreeRenderer implements GameRenderer {
 
     private syncFruits(scene: Scene) {
         const fruits = scene.entities.filter((e): e is FruitEntity => e.type === 'fruit');
-
-        if (!this.fruitGeo) {
-            this.fruitGeo = new THREE.SphereGeometry(0.06, 6, 4);
+        const activeFruitIds = new Set(fruits.map(f => f.id));
+        for (const id of this.fruitRenderedPos.keys()) {
+            if (!activeFruitIds.has(id)) this.fruitRenderedPos.delete(id);
         }
 
-        // Group by speciesId (same color base)
+        if (!this.fruitGeo) {
+            this.fruitGeo = new THREE.SphereGeometry(0.025, 6, 4);
+        }
+
+        const plantMap = new Map<string, PlantEntity>();
+        for (const e of scene.entities) {
+            if (e.type === 'plant') plantMap.set(e.id, e as PlantEntity);
+        }
+
         const groups = new Map<string, FruitEntity[]>();
         for (const fruit of fruits) {
             let arr = groups.get(fruit.speciesId);
@@ -1105,10 +1864,9 @@ class ThreeRenderer implements GameRenderer {
             activeKeys.add(speciesId);
             const count = group.length;
 
-            // Get or create material for this species
             if (!this.fruitMatCache.has(speciesId)) {
                 this.fruitMatCache.set(speciesId, new THREE.MeshLambertMaterial({
-                    color: 0xffffff, // white base — actual color set per-instance via setColorAt
+                    color: 0xffffff,
                 }));
             }
             const mat = this.fruitMatCache.get(speciesId)!;
@@ -1131,16 +1889,50 @@ class ThreeRenderer implements GameRenderer {
 
             inst.count = count;
             const baseColor = new THREE.Color(group[0].color);
+            const species = getSpecies(speciesId);
+            const maxSz = species ? species.maxSize : 7;
 
             for (let i = 0; i < count; i++) {
                 const fruit = group[i];
                 const pos = toWorld(fruit.position);
-                _pos3.set(pos.x, pos.y + 0.03, pos.z);
+
+                const bushSpecies = new Set(['raspberry', 'mushroom', 'thyme', 'sage']);
+                const parent = fruit.parentPlantId ? plantMap.get(fruit.parentPlantId) : undefined;
+
+                if (parent && bushSpecies.has(speciesId)) {
+                    const parentPos = toWorld(parent.position);
+                    const s = Math.max(0.15, parent.growth) * 0.5;
+                    const bushH = maxSz * SCALE * 0.3 * s;
+                    const bushR = maxSz * SCALE * 0.4 * s;
+                    const bushRy = bushR * 0.6;
+
+                    let h = 0;
+                    for (let ci = 0; ci < fruit.id.length; ci++) {
+                        h = ((h << 5) - h + fruit.id.charCodeAt(ci)) | 0;
+                    }
+                    const hNorm = ((h >>> 0) % 10000) / 10000;
+                    const hNorm2 = (((h >>> 0) * 2654435761) % 10000) / 10000;
+                    const theta = hNorm * Math.PI * 2;
+                    const phi = Math.acos(1 - 2 * hNorm2);
+                    const nx = Math.sin(phi) * Math.cos(theta);
+                    const ny = Math.abs(Math.sin(phi) * Math.sin(theta)) * 0.5 + 0.5;
+                    const nz = Math.cos(phi);
+                    const surfaceR = bushR * 1.05;
+                    const surfaceRy = bushRy * 1.05;
+
+                    _pos3.set(
+                        parentPos.x + nx * surfaceR,
+                        parentPos.y + bushH + ny * surfaceRy,
+                        parentPos.z + nz * surfaceR,
+                    );
+                } else {
+                    _pos3.set(pos.x, pos.y + 0.03, pos.z);
+                }
+                this.fruitRenderedPos.set(fruit.id, { x: _pos3.x, y: _pos3.y, z: _pos3.z });
                 _scl3.set(1, 1, 1);
                 _mat4.compose(_pos3, _quat, _scl3);
                 inst.setMatrixAt(i, _mat4);
 
-                // Darken color as fruit rots (last 30% of life)
                 const lifeRatio = 1 - fruit.age / fruit.maxAge;
                 const brightness = lifeRatio < 0.3 ? lifeRatio / 0.3 : 1;
                 _col3.copy(baseColor).multiplyScalar(brightness);
@@ -1150,7 +1942,6 @@ class ThreeRenderer implements GameRenderer {
             if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
         }
 
-        // Remove stale
         for (const [key, mesh] of this.fruitInstances) {
             if (!activeKeys.has(key)) {
                 this.threeScene!.remove(mesh);
@@ -1404,10 +2195,11 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    private updateLighting(nightFactor: number) {
+    private updateLighting(nightFactor: number, weather?: { current: string; rainIntensity: number }) {
         if (!this.sunLight || !this.renderer || !this.threeScene) return;
 
-        // Sky color transitions
+        const weatherType = weather?.current ?? 'sunny';
+
         const dayColor = new THREE.Color(0x87ceeb);
         const nightColor = new THREE.Color(0x0a0a2e);
         const duskColor = new THREE.Color(0xff7b4f);
@@ -1418,22 +2210,64 @@ class ThreeRenderer implements GameRenderer {
         } else if (nightFactor >= 1) {
             skyColor = nightColor;
         } else {
-            // Dawn/dusk golden hour
             skyColor = dayColor.clone().lerp(duskColor, Math.min(1, nightFactor * 3));
             if (nightFactor > 0.3) {
                 skyColor.lerp(nightColor, (nightFactor - 0.3) / 0.7);
             }
         }
 
-        this.renderer.setClearColor(skyColor);
-        if (this.threeScene.fog instanceof THREE.Fog) {
-            this.threeScene.fog.color.copy(skyColor);
+        if (weatherType !== 'sunny') {
+            let overcastGrey: THREE.Color;
+            let strength: number;
+            if (weatherType === 'foggy') {
+                overcastGrey = new THREE.Color(0xc8cdd2);
+                strength = 0.92;
+            } else if (weatherType === 'snowy') {
+                overcastGrey = new THREE.Color(0x9aa5b4);
+                strength = 0.55;
+            } else if (weatherType === 'stormy') {
+                overcastGrey = new THREE.Color(0x3a3f4a);
+                strength = 0.75;
+            } else if (weatherType === 'rainy') {
+                overcastGrey = new THREE.Color(0x6a7585);
+                strength = 0.55;
+            } else {
+                overcastGrey = new THREE.Color(0x8899aa);
+                strength = 0.3;
+            }
+            skyColor.lerp(overcastGrey, strength * (1 - nightFactor * 0.5));
         }
 
-        // Sun intensity
-        this.sunLight.intensity = Math.max(0.1, 1.2 * (1 - nightFactor));
+        if (this.lightningFlash > 0) {
+            skyColor.lerp(new THREE.Color(0xeeeeff), this.lightningFlash * 0.7);
+        }
 
-        // Sun color: warm at dawn/dusk, white at noon
+        this.renderer.setClearColor(skyColor);
+
+        if (this.threeScene.fog instanceof THREE.Fog) {
+            this.threeScene.fog.color.copy(skyColor);
+            let fogNear = 80, fogFar = 200;
+            if (weatherType === 'foggy') { fogNear = 1; fogFar = 12; }
+            else if (weatherType === 'stormy') { fogNear = 15; fogFar = 60; }
+            else if (weatherType === 'snowy') { fogNear = 20; fogFar = 80; }
+            else if (weatherType === 'rainy') { fogNear = 30; fogFar = 100; }
+            else if (weatherType === 'cloudy') { fogNear = 60; fogFar = 160; }
+            this.threeScene.fog.near += (fogNear - this.threeScene.fog.near) * 0.03;
+            this.threeScene.fog.far += (fogFar - this.threeScene.fog.far) * 0.03;
+        }
+
+        let sunMult = 1.0;
+        if (weatherType === 'foggy') sunMult = 0.18;
+        else if (weatherType === 'snowy') sunMult = 0.5;
+        else if (weatherType === 'cloudy') sunMult = 0.6;
+        else if (weatherType === 'rainy') sunMult = 0.35;
+        else if (weatherType === 'stormy') sunMult = 0.2;
+
+        this.sunLight.intensity = Math.max(0.08, 1.2 * (1 - nightFactor) * sunMult);
+        if (this.lightningFlash > 0) {
+            this.sunLight.intensity += this.lightningFlash * 3.5;
+        }
+
         const sunDayColor = new THREE.Color(0xfff5e0);
         const sunDuskColor = new THREE.Color(0xff6622);
         if (nightFactor > 0 && nightFactor < 1) {
@@ -1442,10 +2276,177 @@ class ThreeRenderer implements GameRenderer {
             this.sunLight.color.copy(sunDayColor);
         }
 
-        // Ambient light
         const ambient = this.threeScene.children.find((c) => c instanceof THREE.AmbientLight) as THREE.AmbientLight | undefined;
         if (ambient) {
-            ambient.intensity = 0.2 + 0.4 * (1 - nightFactor);
+            let ambientBase = 0.2 + 0.4 * (1 - nightFactor);
+            ambientBase *= (sunMult * 0.6 + 0.4);
+            ambientBase = Math.max(0.12, ambientBase);
+            if (this.lightningFlash > 0) {
+                ambientBase += this.lightningFlash * 2.5;
+            }
+            ambient.intensity = ambientBase;
+        }
+    }
+
+    // =============================================================
+    //  WEATHER EFFECTS — rain particles, lightning
+    // =============================================================
+
+    private initRainParticles() {
+        if (!this.threeScene) return;
+        const COUNT = ThreeRenderer.RAIN_COUNT;
+        const positions = new Float32Array(COUNT * 2 * 3);
+        for (let i = 0; i < COUNT; i++) {
+            const x = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
+            const y = Math.random() * ThreeRenderer.RAIN_HEIGHT_RANGE;
+            const z = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
+            positions[i * 6 + 0] = x;
+            positions[i * 6 + 1] = y + ThreeRenderer.RAIN_STREAK;
+            positions[i * 6 + 2] = z;
+            positions[i * 6 + 3] = x;
+            positions[i * 6 + 4] = y;
+            positions[i * 6 + 5] = z;
+        }
+        this.rainPositions = positions;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const mat = new THREE.LineBasicMaterial({
+            color: 0xaaccff,
+            transparent: true,
+            opacity: 0.3,
+        });
+        this.rainMesh = new THREE.LineSegments(geo, mat);
+        this.rainMesh.frustumCulled = false;
+        this.rainMesh.visible = false;
+        this.threeScene.add(this.rainMesh);
+    }
+
+    private initSnowParticles() {
+        if (!this.threeScene) return;
+        const COUNT = ThreeRenderer.SNOW_COUNT;
+        const positions = new Float32Array(COUNT * 3);
+        for (let i = 0; i < COUNT; i++) {
+            positions[i * 3 + 0] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
+            positions[i * 3 + 1] = Math.random() * ThreeRenderer.SNOW_HEIGHT_RANGE;
+            positions[i * 3 + 2] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
+        }
+        this.snowPositions = positions;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const mat = new THREE.PointsMaterial({
+            color: 0xffffff,
+            size: 3,
+            sizeAttenuation: false,
+            transparent: true,
+            opacity: 0.85,
+            depthWrite: false,
+        });
+        this.snowMesh = new THREE.Points(geo, mat);
+        this.snowMesh.frustumCulled = false;
+        this.snowMesh.visible = false;
+        this.threeScene.add(this.snowMesh);
+    }
+
+    private updateWeatherEffects(scene: Scene, dt: number) {
+        const weather = scene.weather;
+        const weatherType = weather?.current ?? 'sunny';
+        const intensity = weather?.rainIntensity ?? 0;
+        const isStormy = weatherType === 'stormy';
+        const isSnowy = weatherType === 'snowy';
+        const isRaining = weatherType === 'rainy' || isStormy;
+        const elapsed = this.clock.getElapsedTime();
+
+        if (this.rainMesh && this.rainPositions) {
+            if (!isRaining || intensity <= 0.01) {
+                this.rainMesh.visible = false;
+            } else {
+                this.rainMesh.visible = true;
+                const cam = this.threeCamera!;
+                this.rainMesh.position.set(cam.position.x, 0, cam.position.z);
+
+                const speed = ThreeRenderer.RAIN_SPEED * (0.5 + intensity * 0.5) * (isStormy ? 1.4 : 1);
+                const windX = isStormy
+                    ? Math.sin(elapsed * 0.7) * 6 * dt
+                    : intensity * 1.2 * dt;
+                const activeCount = Math.floor(ThreeRenderer.RAIN_COUNT * intensity);
+
+                for (let i = 0; i < ThreeRenderer.RAIN_COUNT; i++) {
+                    const base = i * 6;
+                    if (i >= activeCount) {
+                        this.rainPositions[base + 1] = -100;
+                        this.rainPositions[base + 4] = -100;
+                        continue;
+                    }
+                    const fall = speed * dt;
+                    this.rainPositions[base + 1] -= fall;
+                    this.rainPositions[base + 4] -= fall;
+                    this.rainPositions[base + 0] += windX;
+                    this.rainPositions[base + 3] += windX;
+
+                    if (this.rainPositions[base + 4] < -1) {
+                        const x = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
+                        const y = ThreeRenderer.RAIN_HEIGHT_RANGE + Math.random() * 3;
+                        const z = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
+                        this.rainPositions[base + 0] = x;
+                        this.rainPositions[base + 1] = y + ThreeRenderer.RAIN_STREAK;
+                        this.rainPositions[base + 2] = z;
+                        this.rainPositions[base + 3] = x;
+                        this.rainPositions[base + 4] = y;
+                        this.rainPositions[base + 5] = z;
+                    }
+                }
+
+                const posAttr = this.rainMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+                posAttr.needsUpdate = true;
+                const rMat = this.rainMesh.material as THREE.LineBasicMaterial;
+                rMat.opacity = 0.15 + intensity * 0.4;
+            }
+        }
+
+        if (this.snowMesh && this.snowPositions) {
+            const snowIntensity = isSnowy ? intensity : 0;
+            if (snowIntensity <= 0.01) {
+                this.snowMesh.visible = false;
+            } else {
+                this.snowMesh.visible = true;
+                const cam = this.threeCamera!;
+                this.snowMesh.position.set(cam.position.x, cam.position.y - ThreeRenderer.SNOW_HEIGHT_RANGE * 0.4, cam.position.z);
+
+                const activeCount = Math.floor(ThreeRenderer.SNOW_COUNT * snowIntensity);
+                for (let i = 0; i < ThreeRenderer.SNOW_COUNT; i++) {
+                    const base = i * 3;
+                    if (i >= activeCount) {
+                        this.snowPositions[base + 1] = -100;
+                        continue;
+                    }
+                    this.snowPositions[base + 1] -= ThreeRenderer.SNOW_SPEED * dt;
+                    const phase = i * 0.1 + elapsed * 0.5;
+                    this.snowPositions[base + 0] += Math.sin(phase) * 0.8 * dt;
+                    this.snowPositions[base + 2] += Math.cos(phase * 0.7) * 0.6 * dt;
+
+                    if (this.snowPositions[base + 1] < -1) {
+                        this.snowPositions[base + 0] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
+                        this.snowPositions[base + 1] = ThreeRenderer.SNOW_HEIGHT_RANGE + Math.random() * 2;
+                        this.snowPositions[base + 2] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
+                    }
+                }
+                const posAttr = this.snowMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+                posAttr.needsUpdate = true;
+                const sMat = this.snowMesh.material as THREE.PointsMaterial;
+                sMat.opacity = 0.5 + snowIntensity * 0.4;
+            }
+        }
+
+        if (isStormy && intensity > 0.3) {
+            this.lightningTimer -= dt;
+            if (this.lightningTimer <= 0) {
+                this.lightningFlash = 0.8 + Math.random() * 0.2;
+                this.lightningTimer = 2 + Math.random() * 7;
+            }
+        }
+        if (this.lightningFlash > 0) {
+            this.lightningFlash -= dt * 5;
+            if (this.lightningFlash < 0) this.lightningFlash = 0;
         }
     }
 
@@ -1482,12 +2483,146 @@ class ThreeRenderer implements GameRenderer {
         this.ground.position.set(centerX, 0, centerZ);
     }
 
+    // =============================================================
+    //  TEXTURE SPLATTING — blends grass/dirt based on terrain data
+    // =============================================================
+
+    private loadGroundDetailTextures() {
+        const loader = new THREE.TextureLoader();
+        this.grassDetailTex = loader.load('/textures/ground/ground-grass.png');
+        this.grassDetailTex.wrapS = this.grassDetailTex.wrapT = THREE.RepeatWrapping;
+        this.grassDetailTex.minFilter = THREE.LinearMipmapLinearFilter;
+        this.grassDetailTex.magFilter = THREE.LinearFilter;
+        this.dirtDetailTex = loader.load('/textures/ground/ground-dirt.png');
+        this.dirtDetailTex.wrapS = this.dirtDetailTex.wrapT = THREE.RepeatWrapping;
+        this.dirtDetailTex.minFilter = THREE.LinearMipmapLinearFilter;
+        this.dirtDetailTex.magFilter = THREE.LinearFilter;
+    }
+
+    private ensureSplatMaterial(scene: Scene) {
+        if (this.groundSplatMat) return;
+        if (!this.grassDetailTex || !this.dirtDetailTex) return;
+        const sg = scene.soilGrid;
+        const hm = scene.heightMap;
+        if (!sg || !hm) return;
+
+        this.buildSplatMap(scene);
+        if (!this.splatTexture) return;
+
+        const worldW = (sg.cols - 1) * sg.cellSize * SCALE;
+        const texRepeat = worldW / 0.5;
+
+        const whitePx = new Uint8Array([255, 255, 255, 255]);
+        const whiteTex = new THREE.DataTexture(whitePx, 1, 1);
+        whiteTex.needsUpdate = true;
+
+        const splatRef = this.splatTexture;
+        const grassRef = this.grassDetailTex;
+        const dirtRef = this.dirtDetailTex;
+
+        this.groundSplatMat = new THREE.MeshLambertMaterial({ map: whiteTex });
+        this.groundSplatMat.onBeforeCompile = (shader) => {
+            this.groundSplatShaderRef = shader;
+            shader.uniforms.uGrass = { value: grassRef };
+            shader.uniforms.uDirt = { value: dirtRef };
+            shader.uniforms.uSplat = { value: splatRef };
+            shader.uniforms.uTexRepeat = { value: texRepeat };
+
+            shader.fragmentShader = shader.fragmentShader.replace(
+                'void main() {',
+                [
+                    'uniform sampler2D uGrass;',
+                    'uniform sampler2D uDirt;',
+                    'uniform sampler2D uSplat;',
+                    'uniform float uTexRepeat;',
+                    'void main() {',
+                ].join('\n')
+            );
+
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <map_fragment>',
+                [
+                    '{',
+                    '    vec2 tUV = vMapUv * uTexRepeat;',
+                    '    vec4 grassC = texture2D(uGrass, tUV);',
+                    '    vec4 dirtC = texture2D(uDirt, tUV);',
+                    '    vec4 splatSample = texture2D(uSplat, vMapUv);',
+                    '    float blend = smoothstep(0.05, 0.95, splatSample.r);',
+                    '    float basin = splatSample.g;',
+                    '    float relief = 1.0 - basin * 0.75;',
+                    '    diffuseColor *= mix(dirtC, grassC, blend) * 0.7 * relief;',
+                    '}',
+                ].join('\n')
+            );
+        };
+    }
+
+    private buildSplatMap(scene: Scene) {
+        const sg = scene.soilGrid;
+        const hm = scene.heightMap;
+        const bm = scene.basinMap;
+        if (!sg || !hm) return;
+        const cols = sg.cols, rows = sg.rows;
+        const range = hm.maxHeight - hm.minHeight || 1;
+
+        if (!this.splatCanvas) {
+            this.splatCanvas = document.createElement('canvas');
+            this.splatCanvas.width = cols;
+            this.splatCanvas.height = rows;
+        }
+        const ctx = this.splatCanvas.getContext('2d')!;
+        const imageData = ctx.createImageData(cols, rows);
+
+        for (let i = 0; i < cols * rows; i++) {
+            const humidity = sg.layers.humidity[i];
+            const elev = (hm.data[i] - hm.minHeight) / range;
+            const rockFactor = Math.min(1, Math.max(0, elev - 0.45) * 2.5);
+            const grassFactor = humidity * (1 - rockFactor);
+            let blend = Math.max(0, Math.min(1, grassFactor * 2.2));
+
+            const st = sg.soilType[i];
+            if (st === 1) blend *= 0.15;
+            else if (st === 3) blend *= 0.05;
+            else if (st === 4) blend = Math.min(1, blend * 1.3);
+
+            const basin = bm ? bm.data[i] : 0;
+            const px = i * 4;
+            imageData.data[px + 0] = Math.round(blend * 255);
+            imageData.data[px + 1] = Math.round(basin * 255);
+            imageData.data[px + 2] = st;
+            imageData.data[px + 3] = 255;
+        }
+        ctx.putImageData(imageData, 0, 0);
+
+        if (this.splatTexture) {
+            this.splatTexture.needsUpdate = true;
+        } else {
+            this.splatTexture = new THREE.CanvasTexture(this.splatCanvas);
+            this.splatTexture.minFilter = THREE.LinearFilter;
+            this.splatTexture.magFilter = THREE.LinearFilter;
+        }
+    }
+
     // --- Ground texture (dynamic, changes with overlay) ---
 
     private updateGroundTexture(scene: Scene) {
         if (!this.ground) return;
 
-        // Determine grid dimensions from whichever source is available
+        const overlay = this.currentOverlay;
+
+        // ===== TEXTURE SPLATTING MODE (no overlay — "Aucun") =====
+        if (!overlay && scene.soilGrid && scene.heightMap) {
+            this.ensureSplatMaterial(scene);
+            if (this.groundSplatMat) {
+                this.buildSplatMap(scene);
+                if (this.ground.material !== this.groundSplatMat) {
+                    this.ground.material = this.groundSplatMat;
+                }
+                return;
+            }
+        }
+
+        // ===== COLORED OVERLAY MODE =====
         const hm = scene.heightMap;
         const sg = scene.soilGrid;
         const bm = scene.basinMap;
@@ -1495,7 +2630,6 @@ class ThreeRenderer implements GameRenderer {
         const rows = hm?.rows ?? sg?.rows ?? 0;
         if (cols === 0 || rows === 0) return;
 
-        // Reuse or create canvas texture
         let canvas: HTMLCanvasElement;
         if (this.groundTexture) {
             canvas = this.groundTexture.image as HTMLCanvasElement;
@@ -1511,7 +2645,6 @@ class ThreeRenderer implements GameRenderer {
 
         const ctx = canvas.getContext('2d')!;
         const imageData = ctx.createImageData(cols, rows);
-        const overlay = this.currentOverlay;
 
         for (let i = 0; i < cols * rows; i++) {
             const px = i * 4;
@@ -1534,8 +2667,13 @@ class ThreeRenderer implements GameRenderer {
                 r = Math.round(200 * (1 - depth) + 10 * depth);
                 g = Math.round(184 * (1 - depth) + 74 * depth);
                 b = Math.round(122 * (1 - depth) + 160 * depth);
-            } else if (overlay && overlay !== 'elevation' && overlay !== 'basin' && overlay !== 'water' && sg) {
-                // Soil property overlay
+            } else if (overlay === 'soilType' && sg) {
+                const stId = SOIL_TYPE_INDEX[sg.soilType[i]];
+                const c = SOIL_TYPE_DEFS[stId].color;
+                r = (c >> 16) & 0xff;
+                g = (c >> 8) & 0xff;
+                b = c & 0xff;
+            } else if (overlay && overlay !== 'elevation' && overlay !== 'basin' && overlay !== 'water' && overlay !== 'soilType' && sg) {
                 const v = sg.layers[overlay as SoilProperty][i];
                 const c = SOIL_OVERLAY_COLORS[overlay as SoilProperty];
                 r = Math.round(c.r0 + v * (c.r1 - c.r0));
@@ -1561,13 +2699,18 @@ class ThreeRenderer implements GameRenderer {
                     // Earth factor: minerals
                     const earthFactor = minerals * 0.6;
 
-                    // Base grass color (golden tan)
-                    let br = 145, bg = 140, bb = 90;
+                    // Base dry color (warm tan)
+                    let br = 140, bg = 130, bb = 85;
 
-                    // Blend towards dark green (humid) — darker to match grass texture
-                    br += Math.round((-110) * greenFactor);  // 145 → 35
-                    bg += Math.round((0) * greenFactor);      // 140 → 140
-                    bb += Math.round((-60) * greenFactor);    // 90 → 30
+                    // Aggressive blend towards very dark olive — matches grass texture shadow
+                    // Uses squared humidity for faster transition into dark
+                    const gf = greenFactor * greenFactor; // 0.5 hum → 0.25, 0.7 → 0.49, 1.0 → 1.0
+                    const darkGf = Math.min(1, greenFactor * 1.8); // saturates earlier
+                    const blendF = Math.max(gf, darkGf * 0.7); // fast ramp
+                    // Target: ~#1E2515 (30, 37, 21) — near-black olive
+                    br += Math.round((-110 * 0.7) * blendF);   // 140 → 30
+                    bg += Math.round((-93 * 0.7) * blendF);    // 130 → 37
+                    bb += Math.round((-64 * 0.7) * blendF);    // 85 → 21
 
                     // Blend towards brown earth (minerals)
                     br += Math.round(15 * earthFactor);
@@ -1608,8 +2751,13 @@ class ThreeRenderer implements GameRenderer {
             this.groundTexture = new THREE.CanvasTexture(canvas);
             this.groundTexture.minFilter = THREE.LinearFilter;
             this.groundTexture.magFilter = THREE.LinearFilter;
-            (this.ground.material as THREE.MeshLambertMaterial).dispose();
-            this.ground.material = new THREE.MeshLambertMaterial({ map: this.groundTexture });
+        }
+
+        if (!this.groundOverlayMat) {
+            this.groundOverlayMat = new THREE.MeshLambertMaterial({ map: this.groundTexture });
+        }
+        if (this.ground.material !== this.groundOverlayMat) {
+            this.ground.material = this.groundOverlayMat;
         }
 
         // If no heightmap applied yet, also resize geometry to match grid

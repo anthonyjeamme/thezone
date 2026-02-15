@@ -79,7 +79,7 @@ export function processWorld(scene: Scene, dt: number) {
     processReproduction(scene, dt);
     processFertileZones(scene, dt);
     processWeather(scene, dt);
-    if (scene.soilGrid) processSoilCycles(scene.soilGrid, dt);
+    if (scene.soilGrid) processSoilCycles(scene.soilGrid, dt, scene.heightMap);
     processFlora(scene, dt);
 }
 

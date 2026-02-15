@@ -8,6 +8,7 @@ import { BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity, H
 import { getSpecies } from '../../World/flora';
 import { Vector2D } from '../../Shared/vector';
 import { GESTATION_DURATION } from '../../World/reproduction';
+import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
 import type { SoilGrid } from '../../World/fertility';
 import type { HeightMap, BasinMap } from '../../World/heightmap';
 
@@ -62,7 +63,9 @@ class Canvas2DRenderer implements GameRenderer {
             renderHeightGrid(ctx, scene.heightMap, camera, this.canvas.width, this.canvas.height);
         } else if (soilOverlay === 'basin' && scene.basinMap) {
             renderBasinGrid(ctx, scene.basinMap, camera, this.canvas.width, this.canvas.height);
-        } else if (scene.soilGrid && soilOverlay && soilOverlay !== 'elevation' && soilOverlay !== 'basin' && soilOverlay !== 'water') {
+        } else if (soilOverlay === 'soilType' && scene.soilGrid) {
+            renderSoilTypeGrid(ctx, scene.soilGrid, camera, this.canvas.width, this.canvas.height);
+        } else if (scene.soilGrid && soilOverlay && soilOverlay !== 'elevation' && soilOverlay !== 'basin' && soilOverlay !== 'water' && soilOverlay !== 'soilType') {
             renderSoilGrid(ctx, scene.soilGrid, soilOverlay, camera, this.canvas.width, this.canvas.height);
         }
 
@@ -504,14 +507,14 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
         ctx.beginPath();
         ctx.ellipse(x + 2, y - 3, 2, 1.2, 0.5, 0, Math.PI * 2);
         ctx.fill();
-    } else if (species.id === 'oak' || species.id === 'pine') {
+    } else if (species.id === 'oak' || species.id === 'birch' || species.id === 'willow'
+        || species.id === 'apple' || species.id === 'cherry' || species.id === 'pine') {
         // Tree: trunk + crown
         const trunkH = size * 0.6;
         const trunkW = size * 0.25;
-        ctx.fillStyle = '#6B4226';
+        ctx.fillStyle = species.id === 'birch' ? '#E8DCC8' : '#6B4226';
         ctx.fillRect(x - trunkW / 2, y - trunkH / 2, trunkW, trunkH);
 
-        // Crown
         ctx.fillStyle = color;
         ctx.globalAlpha = 0.85;
         ctx.beginPath();
@@ -521,29 +524,48 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
             ctx.lineTo(x - size * 0.7, y + size * 0.2);
             ctx.lineTo(x + size * 0.7, y + size * 0.2);
             ctx.closePath();
+        } else if (species.id === 'willow') {
+            // Wider, droopy crown
+            ctx.ellipse(x, y - size * 0.2, size * 0.9, size * 0.5, 0, 0, Math.PI * 2);
         } else {
-            // Circle for oak
-            ctx.save()
-            ctx.translate(0, -size * 0.3);
+            // Circle for oak, birch, apple, cherry
             ctx.arc(x, y - size * 0.3, size * 0.75, 0, Math.PI * 2);
-            ctx.restore();
         }
         ctx.fill();
+    } else if (species.id === 'mushroom') {
+        // Mushroom: small stem + wide cap
+        ctx.fillStyle = '#E8DCC0';
+        ctx.fillRect(x - size * 0.1, y - size * 0.1, size * 0.2, size * 0.4);
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.ellipse(x, y - size * 0.15, size * 0.5, size * 0.25, 0, Math.PI, 0);
+        ctx.fill();
+    } else if (species.id === 'reed') {
+        // Reed: thin tall line
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y + size * 0.5);
+        ctx.lineTo(x, y - size * 0.5);
+        ctx.stroke();
+        // Tiny tuft
+        ctx.fillStyle = '#B8A880';
+        ctx.beginPath();
+        ctx.ellipse(x, y - size * 0.5, size * 0.12, size * 0.2, 0, 0, Math.PI * 2);
+        ctx.fill();
     } else if (species.id === 'raspberry') {
-        // Raspberry bush: rounded bushy shape
+        // Raspberry bush
         ctx.fillStyle = color;
         ctx.globalAlpha = 0.85;
-        // Main bush body — wide low oval
         ctx.beginPath();
         ctx.ellipse(x, y, size * 0.7, size * 0.5, 0, 0, Math.PI * 2);
         ctx.fill();
-        // Darker center for depth
         ctx.fillStyle = species.matureColor;
         ctx.globalAlpha = 0.5;
         ctx.beginPath();
         ctx.ellipse(x, y + size * 0.1, size * 0.4, size * 0.3, 0, 0, Math.PI * 2);
         ctx.fill();
-        // Small berry dots if mature
         if (plant.growth > 0.75) {
             ctx.fillStyle = '#C2185B';
             ctx.globalAlpha = 0.9;
@@ -554,6 +576,13 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
                 ctx.fill();
             }
         }
+    } else if (species.id === 'thyme' || species.id === 'sage') {
+        // Low herb bush: flat oval
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.ellipse(x, y, size * 0.6, size * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill();
     } else if (species.id === 'wheat') {
         // Wheat stalk
         ctx.strokeStyle = color;
@@ -562,19 +591,17 @@ function renderPlant(ctx: CanvasRenderingContext2D, plant: PlantEntity) {
         ctx.moveTo(x, y + size * 0.5);
         ctx.lineTo(x, y - size * 0.5);
         ctx.stroke();
-        // Grain head
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.ellipse(x, y - size * 0.5, size * 0.3, size * 0.5, 0, 0, Math.PI * 2);
         ctx.fill();
     } else {
-        // Default: flower / small plant — colored circle
+        // Wildflower / default
         ctx.fillStyle = color;
         ctx.globalAlpha = 0.9;
         ctx.beginPath();
         ctx.arc(x, y, size * 0.6, 0, Math.PI * 2);
         ctx.fill();
-        // Center dot
         ctx.fillStyle = '#fff';
         ctx.globalAlpha = 0.5;
         ctx.beginPath();
@@ -620,10 +647,10 @@ import type { SoilProperty } from '../../World/fertility';
 
 /** Color palettes per soil property: low → high */
 const SOIL_COLORS: Record<SoilProperty, { r0: number; g0: number; b0: number; r1: number; g1: number; b1: number }> = {
-    humidity:      { r0: 200, g0: 184, b0: 122, r1: 26, g1: 122, b1: 180 },  // sand → blue
-    minerals:      { r0: 180, g0: 170, b0: 150, r1: 160, g1: 100, b1: 30 },  // grey → orange-brown
+    humidity: { r0: 200, g0: 184, b0: 122, r1: 26, g1: 122, b1: 180 },  // sand → blue
+    minerals: { r0: 180, g0: 170, b0: 150, r1: 160, g1: 100, b1: 30 },  // grey → orange-brown
     organicMatter: { r0: 200, g0: 190, b0: 170, r1: 40, g1: 30, b1: 10 },    // pale → dark earth
-    sunExposure:   { r0: 60, g0: 60, b0: 80, r1: 255, g1: 240, b1: 140 },    // shadow → bright yellow
+    sunExposure: { r0: 60, g0: 60, b0: 80, r1: 255, g1: 240, b1: 140 },    // shadow → bright yellow
 };
 
 function soilColor(value: number, prop: SoilProperty): string {
@@ -669,6 +696,47 @@ function renderSoilGrid(
             const wy = grid.originY + row * cs;
 
             ctx.fillStyle = soilColor(layer[idx], prop);
+            ctx.fillRect(wx, wy, cs, cs);
+        }
+    }
+
+    ctx.restore();
+}
+
+function renderSoilTypeGrid(
+    ctx: CanvasRenderingContext2D,
+    grid: SoilGrid,
+    camera: Camera,
+    canvasWidth: number,
+    canvasHeight: number,
+) {
+    const dpr = window.devicePixelRatio || 1;
+    const viewW = canvasWidth / dpr;
+    const viewH = canvasHeight / dpr;
+
+    const worldLeft = -camera.position.x - viewW / 2;
+    const worldTop = -camera.position.y - viewH / 2;
+    const worldRight = worldLeft + viewW;
+    const worldBottom = worldTop + viewH;
+
+    const colStart = Math.max(0, Math.floor((worldLeft - grid.originX) / grid.cellSize));
+    const colEnd = Math.min(grid.cols, Math.ceil((worldRight - grid.originX) / grid.cellSize));
+    const rowStart = Math.max(0, Math.floor((worldTop - grid.originY) / grid.cellSize));
+    const rowEnd = Math.min(grid.rows, Math.ceil((worldBottom - grid.originY) / grid.cellSize));
+
+    const cs = grid.cellSize;
+
+    ctx.save();
+    ctx.globalAlpha = 1;
+
+    for (let row = rowStart; row < rowEnd; row++) {
+        for (let col = colStart; col < colEnd; col++) {
+            const idx = row * grid.cols + col;
+            const wx = grid.originX + col * cs;
+            const wy = grid.originY + row * cs;
+            const stId = SOIL_TYPE_INDEX[grid.soilType[idx]];
+            const c = SOIL_TYPE_DEFS[stId].color;
+            ctx.fillStyle = `rgb(${(c >> 16) & 0xff},${(c >> 8) & 0xff},${c & 0xff})`;
             ctx.fillRect(wx, wy, cs, cs);
         }
     }

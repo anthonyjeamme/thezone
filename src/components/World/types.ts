@@ -23,6 +23,15 @@ export type ResourceType = 'food' | 'water' | 'wood';
 
 export const CABIN_WOOD_COST = 3;   // wood items needed to build a cabin
 
+// --- World bounds ---
+
+export const WORLD_HALF = 1200;    // world extends from -WORLD_HALF to +WORLD_HALF on each axis
+
+/** Returns true if the position is inside the playable world area */
+export function isInWorldBounds(x: number, y: number): boolean {
+    return x >= -WORLD_HALF && x <= WORLD_HALF && y >= -WORLD_HALF && y <= WORLD_HALF;
+}
+
 // --- Calendar ---
 
 export const SECONDS_PER_HOUR = 10;                          // 1 game hour = 10 real seconds at x1
@@ -464,6 +473,8 @@ export type PlantEntity = {
     stage: PlantGrowthStage;
     seedTimer: number;        // sim-seconds until next seed dispersal
     fruitTimer: number;       // sim-seconds until next fruit production
+    dormancyTimer: number;    // sim-seconds remaining for seed dormancy (0 = not dormant)
+    owner?: string;           // null/undefined = wild, string = player/NPC who planted it
 };
 
 // --- Fruit Entity ---
@@ -471,13 +482,14 @@ export type PlantEntity = {
 export type FruitEntity = {
     id: string;
     type: 'fruit';
-    speciesId: string;        // which plant species produced this fruit
-    fruitName: string;        // display name (e.g. "Gland", "Grain")
+    speciesId: string;
+    fruitName: string;
     position: Vector2D;
-    nutritionValue: number;   // food value when consumed (0..1)
-    age: number;              // sim-seconds since dropped
-    maxAge: number;           // sim-seconds before rotting completely
-    color: string;            // rendering color
+    nutritionValue: number;
+    age: number;
+    maxAge: number;
+    color: string;
+    parentPlantId?: string;
 };
 
 // --- Scene ---

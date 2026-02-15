@@ -6,7 +6,7 @@
 
 import type { Scene } from './types';
 import type { BasinMap } from './heightmap';
-import type { SoilGrid } from './fertility';
+import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX, type SoilGrid } from './fertility';
 import { getWaterSurfaceElevation } from './heightmap';
 import { SECONDS_PER_HOUR } from './types';
 
@@ -14,7 +14,7 @@ import { SECONDS_PER_HOUR } from './types';
 //  Types
 // =============================================================
 
-export type WeatherType = 'sunny' | 'cloudy' | 'rainy' | 'stormy';
+export type WeatherType = 'sunny' | 'cloudy' | 'rainy' | 'stormy' | 'foggy' | 'snowy';
 
 export type WeatherState = {
     /** Current weather */
@@ -38,6 +38,8 @@ export const WEATHER_LABELS: Record<WeatherType, string> = {
     cloudy: 'Nuageux',
     rainy: 'Pluie',
     stormy: 'Orage',
+    foggy: 'Brumeux',
+    snowy: 'Neige',
 };
 
 export const WEATHER_ICONS: Record<WeatherType, string> = {
@@ -45,6 +47,8 @@ export const WEATHER_ICONS: Record<WeatherType, string> = {
     cloudy: '☁️',
     rainy: '🌧️',
     stormy: '⛈️',
+    foggy: '🌫️',
+    snowy: '❄️',
 };
 
 // =============================================================
@@ -53,10 +57,12 @@ export const WEATHER_ICONS: Record<WeatherType, string> = {
 
 /** Probability weights for the next weather state given the current one */
 const TRANSITIONS: Record<WeatherType, Record<WeatherType, number>> = {
-    sunny:  { sunny: 0.45, cloudy: 0.45, rainy: 0.08, stormy: 0.02 },
-    cloudy: { sunny: 0.30, cloudy: 0.30, rainy: 0.30, stormy: 0.10 },
-    rainy:  { sunny: 0.10, cloudy: 0.35, rainy: 0.40, stormy: 0.15 },
-    stormy: { sunny: 0.05, cloudy: 0.25, rainy: 0.50, stormy: 0.20 },
+    sunny:  { sunny: 0.40, cloudy: 0.40, rainy: 0.07, stormy: 0.02, foggy: 0.08, snowy: 0.03 },
+    cloudy: { sunny: 0.25, cloudy: 0.25, rainy: 0.22, stormy: 0.08, foggy: 0.14, snowy: 0.06 },
+    rainy:  { sunny: 0.08, cloudy: 0.28, rainy: 0.35, stormy: 0.12, foggy: 0.12, snowy: 0.05 },
+    stormy: { sunny: 0.05, cloudy: 0.20, rainy: 0.38, stormy: 0.15, foggy: 0.12, snowy: 0.10 },
+    foggy:  { sunny: 0.15, cloudy: 0.35, rainy: 0.20, stormy: 0.05, foggy: 0.20, snowy: 0.05 },
+    snowy:  { sunny: 0.05, cloudy: 0.20, rainy: 0.10, stormy: 0.10, foggy: 0.10, snowy: 0.45 },
 };
 
 /** Duration range for each weather type [min, max] in game hours */
@@ -65,6 +71,8 @@ const DURATION_RANGE: Record<WeatherType, [number, number]> = {
     cloudy: [2, 10],
     rainy:  [1, 8],
     stormy: [0.5, 3],
+    foggy:  [2, 8],
+    snowy:  [1, 6],
 };
 
 // =============================================================
@@ -107,7 +115,7 @@ export function createWeatherState(): WeatherState {
 }
 
 /** All weather types, exported for UI iteration */
-export const WEATHER_TYPES: WeatherType[] = ['sunny', 'cloudy', 'rainy', 'stormy'];
+export const WEATHER_TYPES: WeatherType[] = ['sunny', 'cloudy', 'rainy', 'stormy', 'foggy', 'snowy'];
 
 // =============================================================
 //  Simulation — called each tick
@@ -137,13 +145,15 @@ export function processWeather(scene: Scene, dt: number) {
         }
     }
 
-    // --- Update rain intensity (smooth ramp) ---
+    // --- Update rain/snow intensity (smooth ramp) ---
     const isRaining = weather.current === 'rainy' || weather.current === 'stormy';
-    const targetIntensity = isRaining
-        ? (weather.current === 'stormy' ? 1.0 : 0.5)
-        : 0;
+    const isSnowing = weather.current === 'snowy';
+    let targetIntensity: number;
+    if (weather.current === 'stormy') targetIntensity = 1.0;
+    else if (isSnowing) targetIntensity = 0.6;
+    else if (isRaining) targetIntensity = 0.5;
+    else targetIntensity = 0;
 
-    // Smooth ramp: ~2 game-hours to fully ramp up/down
     const rampSpeed = 1 / (2 * SECONDS_PER_HOUR);
     if (weather.rainIntensity < targetIntensity) {
         weather.rainIntensity = Math.min(targetIntensity, weather.rainIntensity + rampSpeed * dt);
@@ -151,14 +161,18 @@ export function processWeather(scene: Scene, dt: number) {
         weather.rainIntensity = Math.max(targetIntensity, weather.rainIntensity - rampSpeed * dt);
     }
 
-    // --- Apply rain to soil using basin map ---
+    // --- Apply rain/snow to soil using basin map ---
     if (weather.rainIntensity > 0 && scene.soilGrid && scene.basinMap) {
-        applyRain(scene.soilGrid, scene.basinMap, weather.rainIntensity, dt);
+        const effectiveIntensity = isSnowing
+            ? weather.rainIntensity * 0.4
+            : weather.rainIntensity;
+        applyRain(scene.soilGrid, scene.basinMap, effectiveIntensity, dt);
     }
 
-    // --- Evaporation when not raining ---
+    // --- Evaporation (fog greatly slows it, rain/snow stops it) ---
     if (weather.rainIntensity === 0 && scene.soilGrid) {
-        applyEvaporation(scene.soilGrid, dt);
+        const evapDt = weather.current === 'foggy' ? dt * 0.2 : dt;
+        applyEvaporation(scene.soilGrid, evapDt);
     }
 
     // --- Update surface water (lakes via depression map) ---
@@ -201,23 +215,27 @@ function randomDuration(type: WeatherType): number {
 function applyRain(soilGrid: SoilGrid, basinMap: BasinMap, intensity: number, dt: number) {
     const humidity = soilGrid.layers.humidity;
     const basin = basinMap.data;
+    const { soilType } = soilGrid;
     const count = soilGrid.cols * soilGrid.rows;
 
     for (let i = 0; i < count; i++) {
-        // Basin value [0..1]: 0 = ridge, 1 = deep basin
-        // Water accumulates more in basins
         const basinFactor = RAIN_BASE_GAIN + basin[i] * (1 - RAIN_BASE_GAIN);
-        const gain = RAIN_HUMIDITY_RATE * intensity * basinFactor * dt;
+        const def = SOIL_TYPE_DEFS[SOIL_TYPE_INDEX[soilType[i]]];
+        const retention = 1.0 - def.drainageRate * 0.6;
+        const gain = RAIN_HUMIDITY_RATE * intensity * basinFactor * retention * dt;
         humidity[i] = Math.min(1, humidity[i] + gain);
     }
 }
 
 function applyEvaporation(soilGrid: SoilGrid, dt: number) {
     const humidity = soilGrid.layers.humidity;
+    const { soilType } = soilGrid;
     const count = soilGrid.cols * soilGrid.rows;
 
     for (let i = 0; i < count; i++) {
-        humidity[i] = Math.max(0, humidity[i] - EVAPORATION_RATE * dt);
+        const def = SOIL_TYPE_DEFS[SOIL_TYPE_INDEX[soilType[i]]];
+        const evapMult = 0.5 + def.drainageRate * 1.0;
+        humidity[i] = Math.max(0, humidity[i] - EVAPORATION_RATE * evapMult * dt);
     }
 }
 

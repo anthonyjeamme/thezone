@@ -8,7 +8,7 @@ import { Vector2D } from '../Shared/vector';
 import type { SoilProperty } from '../World/fertility';
 
 /** Which layer to render as overlay, or null for none */
-export type SoilOverlay = SoilProperty | 'elevation' | 'basin' | 'water' | null;
+export type SoilOverlay = SoilProperty | 'elevation' | 'basin' | 'water' | 'soilType' | null;
 
 /**
  * Abstract renderer interface.
