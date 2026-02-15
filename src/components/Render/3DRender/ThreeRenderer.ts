@@ -8,7 +8,7 @@ import { GameRenderer, registerRenderer } from '../GameRenderer';
 import {
     BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity,
     Highlight, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity,
-    getCalendar, getLifeStage, LifeStage,
+    getCalendar, getLifeStage, LifeStage, WORLD_HALF,
 } from '../../World/types';
 import { getSpecies } from '../../World/flora';
 import { Vector2D } from '../../Shared/vector';
@@ -341,13 +341,14 @@ class ThreeRenderer implements GameRenderer {
     private grassChunks = new Map<string, { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number }>();
     private grassMat: THREE.MeshLambertMaterial | null = null;
     private grassPlaneGeo: THREE.PlaneGeometry | null = null;
+    private grassShaderRef: THREE.WebGLProgramParametersWithUniforms | null = null;
     private grassLastCamX = Infinity;
     private grassLastCamZ = Infinity;
     private static readonly GRASS_CHUNK_SIZE = 80;
     private static readonly GRASS_RENDER_RADIUS = 550;
     private static readonly GRASS_LOD_BOUNDARY = 180;
-    private static readonly GRASS_STEP_NEAR = 1.0;
-    private static readonly GRASS_STEP_FAR = 3.5;
+    private static readonly GRASS_STEP_NEAR = 0.5;
+    private static readonly GRASS_STEP_FAR = 2.5;
     private static readonly GRASS_SCALE_FAR = 1.6;
     // Sun light
     private sunLight: THREE.DirectionalLight | null = null;
@@ -373,7 +374,7 @@ class ThreeRenderer implements GameRenderer {
     private playerMesh: THREE.Group | null = null;
     private playerPos = { x: 0, y: 0 }; // 2D world position (game units)
     private playerAngle = 0;             // facing direction (radians, smoothed)
-    private thirdPerson = true;
+    private thirdPerson = false;
     private keysDown = new Set<string>();
     private keyHandler: ((e: KeyboardEvent) => void) | null = null;
     private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
@@ -384,14 +385,8 @@ class ThreeRenderer implements GameRenderer {
     private pointerLockHandler: (() => void) | null = null;
     private static readonly PLAYER_SPEED = 0.5;
     private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
-    private static readonly MOUSE_SENSITIVITY = 0.00035;
-    // Camera rig parameters
-    private static readonly CAM_TARGET_HEIGHT = 0.28;
-    private static readonly CAM_BACK = 0.55;
-    private static readonly CAM_UP = 0.16;
-    private static readonly CAM_SHOULDER = 0.255;
-    private shoulderSide = 1;
-    private smoothShoulder = 1;
+    private static readonly MOUSE_SENSITIVITY = 0.001;
+    private static readonly FP_EYE_HEIGHT = 0.216;
     // Smoothing half-lives (seconds) — lower = snappier
     private static readonly HL_CAM_POS = 0.01;
     private static readonly HL_CAM_Y = 0.01;
@@ -431,12 +426,15 @@ class ThreeRenderer implements GameRenderer {
         this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
         this.renderer.shadowMap.enabled = true;
         this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        this.renderer.setClearColor(0x87ceeb); // sky blue
+        this.renderer.setClearColor(0x87ceeb);
+        this.renderer.domElement.style.display = 'block';
+        this.renderer.domElement.style.width = '100%';
+        this.renderer.domElement.style.height = '100%';
         container.appendChild(this.renderer.domElement);
 
         // --- Scene ---
         this.threeScene = new THREE.Scene();
-        this.threeScene.fog = new THREE.Fog(0x87ceeb, 80, 200);
+        this.threeScene.fog = new THREE.Fog(0x87ceeb, 40, 120);
 
         // --- Camera ---
         this.threeCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
@@ -451,7 +449,7 @@ class ThreeRenderer implements GameRenderer {
         this.controls.minDistance = 5;
         this.controls.maxDistance = 150;
         this.controls.target.set(0, 0, 0);
-        this.controls.enabled = !this.thirdPerson;
+        this.controls.enabled = false;
 
         // --- Lights ---
         const ambient = new THREE.AmbientLight(0xffffff, 0.5);
@@ -502,7 +500,7 @@ class ThreeRenderer implements GameRenderer {
         const groundMat = new THREE.MeshLambertMaterial({ color: 0x3a7d44 });
         this.ground = new THREE.Mesh(groundGeo, groundMat);
         this.ground.rotation.x = -Math.PI / 2;
-        this.ground.position.y = 0;
+        this.ground.position.y = -0.5;
         this.ground.receiveShadow = true;
         this.threeScene.add(this.ground);
 
@@ -555,9 +553,6 @@ class ThreeRenderer implements GameRenderer {
         this.keyHandler = (e: KeyboardEvent) => {
             const k = e.key.toLowerCase();
             this.keysDown.add(k);
-            if (k === 'x' && this.thirdPerson) {
-                this.shoulderSide *= -1;
-            }
         };
         this.keyUpHandler = (e: KeyboardEvent) => this.keysDown.delete(e.key.toLowerCase());
         window.addEventListener('keydown', this.keyHandler);
@@ -565,18 +560,16 @@ class ThreeRenderer implements GameRenderer {
 
         // --- Mouse look (pointer lock) ---
         this.mouseMoveHandler = (e: MouseEvent) => {
-            if (!this.thirdPerson) return;
             if (document.pointerLockElement !== this.renderer!.domElement) return;
             this.cameraYaw -= e.movementX * ThreeRenderer.MOUSE_SENSITIVITY;
             this.cameraPitch += e.movementY * ThreeRenderer.MOUSE_SENSITIVITY;
-            // Clamp pitch: slightly below horizontal to almost overhead
-            this.cameraPitch = Math.max(-1.2, Math.min(1.3, this.cameraPitch));
+            this.cameraPitch = Math.max(-1.4, Math.min(1.4, this.cameraPitch));
         };
         document.addEventListener('mousemove', this.mouseMoveHandler);
 
         // Request pointer lock on click when in third-person
         this.pointerLockHandler = () => {
-            if (this.thirdPerson && document.pointerLockElement !== this.renderer!.domElement) {
+            if (document.pointerLockElement !== this.renderer!.domElement) {
                 this.renderer!.domElement.requestPointerLock();
             }
         };
@@ -616,6 +609,11 @@ class ThreeRenderer implements GameRenderer {
             this.updateGrassChunks(scene);
         }
 
+        // --- Update grass wind shader ---
+        if (this.grassShaderRef) {
+            this.grassShaderRef.uniforms.uWindTime.value = elapsed;
+        }
+
         // --- Update ground texture when overlay changes ---
         const overlay = soilOverlay ?? null;
         if (overlay !== this.currentOverlay || !this.groundTextureApplied) {
@@ -650,9 +648,6 @@ class ThreeRenderer implements GameRenderer {
         this.updatePlayer(scene, elapsed);
 
         // --- Render ---
-        if (!this.thirdPerson) {
-            this.controls.update();
-        }
         this.renderer.render(this.threeScene, this.threeCamera);
 
         // --- Interaction HUD (drawn AFTER 3D render) ---
@@ -662,15 +657,19 @@ class ThreeRenderer implements GameRenderer {
     resize(width: number, height: number): void {
         if (!this.renderer || !this.threeCamera) return;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        this.renderer.setSize(width, height);
+        const w = Math.floor(width);
+        const h = Math.floor(height);
+        this.renderer.setSize(w, h, false);
         this.renderer.setPixelRatio(dpr);
-        this.threeCamera.aspect = width / height;
+        this.renderer.domElement.style.width = '100%';
+        this.renderer.domElement.style.height = '100%';
+        this.threeCamera.aspect = w / h;
         this.threeCamera.updateProjectionMatrix();
         if (this.interactCanvas) {
-            this.interactCanvas.width = width * dpr;
-            this.interactCanvas.height = height * dpr;
-            this.interactCanvas.style.width = `${width}px`;
-            this.interactCanvas.style.height = `${height}px`;
+            this.interactCanvas.width = w * dpr;
+            this.interactCanvas.height = h * dpr;
+            this.interactCanvas.style.width = '100%';
+            this.interactCanvas.style.height = '100%';
         }
     }
 
@@ -716,24 +715,16 @@ class ThreeRenderer implements GameRenderer {
         return { leftX: 0, leftY: 0, rightX: 0, rightY: 0, sprint: false };
     }
 
-    private updatePlayer(_scene: Scene, elapsed: number) {
-        if (!this.playerMesh || !this.threeCamera) return;
+    private updatePlayer(_scene: Scene, _elapsed: number) {
+        if (!this.threeCamera) return;
 
-        if (!this.thirdPerson) {
-            this.playerMesh.visible = false;
-            return;
-        }
-
-        this.playerMesh.visible = true;
+        if (this.playerMesh) this.playerMesh.visible = false;
 
         const dt = this.clock.getDelta() || 1 / 60;
         const gp = this.pollGamepad();
         const sprinting = this.keysDown.has('shift') || gp.sprint;
         const speed = ThreeRenderer.PLAYER_SPEED * (sprinting ? ThreeRenderer.PLAYER_SPRINT_MULT : 1);
 
-        // =============================================
-        //  1) INPUT — camera-relative movement direction
-        // =============================================
         const sinYaw = Math.sin(this.cameraYaw);
         const cosYaw = Math.cos(this.cameraYaw);
         const fwdX = sinYaw;
@@ -753,129 +744,32 @@ class ThreeRenderer implements GameRenderer {
 
         this.cameraYaw -= gp.rightX * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
         this.cameraPitch += gp.rightY * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
-        this.cameraPitch = Math.max(-1.2, Math.min(1.3, this.cameraPitch));
+        this.cameraPitch = Math.max(-1.4, Math.min(1.4, this.cameraPitch));
 
         let moveX = fwdX * inputFwd + rightX * inputRight;
         let moveZ = fwdZ * inputFwd + rightZ * inputRight;
-        const moving = moveX !== 0 || moveZ !== 0;
 
-        if (moving) {
+        if (moveX !== 0 || moveZ !== 0) {
             const len = Math.sqrt(moveX * moveX + moveZ * moveZ);
             moveX /= len;
             moveZ /= len;
-        }
-
-        // =============================================
-        //  2) PIVOT — the logical point the camera orbits around
-        //     Input moves this instantly. Everything else follows.
-        // =============================================
-        if (moving) {
             this.playerPos.x += (moveX / SCALE) * speed * dt;
             this.playerPos.y += (moveZ / SCALE) * speed * dt;
         }
+
         const pivotW = toWorld(this.playerPos);
+        const eyeX = pivotW.x;
+        const eyeY = pivotW.y + ThreeRenderer.FP_EYE_HEIGHT;
+        const eyeZ = pivotW.z;
 
-        // =============================================
-        //  3) CHARACTER MESH — smoothly follows the pivot
-        //     Has its own position + rotation interpolation.
-        //     This creates the organic "character catches up" feel.
-        // =============================================
-        if (!this.cameraInited) {
-            this.smoothMeshPos.set(pivotW.x, pivotW.y, pivotW.z);
-            this.smoothMeshAngle = this.cameraYaw;
-        } else {
-            const meshAlphaXZ = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_POS);
-            const meshAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_Y);
-            this.smoothMeshPos.x += (pivotW.x - this.smoothMeshPos.x) * meshAlphaXZ;
-            this.smoothMeshPos.z += (pivotW.z - this.smoothMeshPos.z) * meshAlphaXZ;
-            this.smoothMeshPos.y += (pivotW.y - this.smoothMeshPos.y) * meshAlphaY;
-        }
+        this.threeCamera.position.set(eyeX, eyeY, eyeZ);
 
-        if (moving) {
-            const targetAngle = Math.atan2(moveX, moveZ);
-            let angleDiff = targetAngle - this.smoothMeshAngle;
-            if (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-            if (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-            const rotAlpha = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_MESH_ROT);
-            this.smoothMeshAngle += angleDiff * rotAlpha;
-        }
-
-        this.playerMesh.position.copy(this.smoothMeshPos);
-        this.playerMesh.rotation.y = this.smoothMeshAngle;
-        animateWalk(this.playerMesh, elapsed, moving, sprinting);
-
-        // =============================================
-        //  4) CAMERA TARGET — smoothly follows the pivot
-        //     Separate from the mesh so camera doesn't jitter
-        //     when the character catches up.
-        // =============================================
-        const rawTargetX = pivotW.x;
-        const rawTargetY = pivotW.y + ThreeRenderer.CAM_TARGET_HEIGHT;
-        const rawTargetZ = pivotW.z;
-
-        const camTgtAlpha = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_POS);
-        const camTgtAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_Y);
-
-        if (!this.cameraInited) {
-            this.smoothTargetPos.set(rawTargetX, rawTargetY, rawTargetZ);
-            this.smoothCamPos.set(
-                rawTargetX - sinYaw * ThreeRenderer.CAM_BACK,
-                rawTargetY + ThreeRenderer.CAM_UP + Math.sin(this.cameraPitch) * ThreeRenderer.CAM_BACK,
-                rawTargetZ - cosYaw * ThreeRenderer.CAM_BACK
-            );
-            this.cameraInited = true;
-        } else {
-            this.smoothTargetPos.x += (rawTargetX - this.smoothTargetPos.x) * camTgtAlpha;
-            this.smoothTargetPos.z += (rawTargetZ - this.smoothTargetPos.z) * camTgtAlpha;
-            this.smoothTargetPos.y += (rawTargetY - this.smoothTargetPos.y) * camTgtAlphaY;
-        }
-
-        const target = this.smoothTargetPos;
-
-        // =============================================
-        //  5) CAMERA POSITION — orbits around the smoothed target
-        // =============================================
         const cosPitch = Math.cos(this.cameraPitch);
         const sinPitch = Math.sin(this.cameraPitch);
-
-        const orbX = -sinYaw * cosPitch * ThreeRenderer.CAM_BACK;
-        const orbY = sinPitch * ThreeRenderer.CAM_BACK + ThreeRenderer.CAM_UP;
-        const orbZ = -cosYaw * cosPitch * ThreeRenderer.CAM_BACK;
-
-        const shoulderAlpha = ThreeRenderer.hlAlpha(dt, 0.12);
-        this.smoothShoulder += (this.shoulderSide - this.smoothShoulder) * shoulderAlpha;
-        const shoulder = ThreeRenderer.CAM_SHOULDER * this.smoothShoulder;
-        const shoulderX = -cosYaw * shoulder;
-        const shoulderZ = sinYaw * shoulder;
-
-        const desiredCamX = target.x + orbX + shoulderX;
-        const desiredCamY = target.y + orbY;
-        const desiredCamZ = target.z + orbZ + shoulderZ;
-
-        const camAlphaXZ = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_POS);
-        const camAlphaY = ThreeRenderer.hlAlpha(dt, ThreeRenderer.HL_CAM_Y);
-        this.smoothCamPos.x += (desiredCamX - this.smoothCamPos.x) * camAlphaXZ;
-        this.smoothCamPos.z += (desiredCamZ - this.smoothCamPos.z) * camAlphaXZ;
-        this.smoothCamPos.y += (desiredCamY - this.smoothCamPos.y) * camAlphaY;
-
-        const camGround = toWorld({
-            x: this.smoothCamPos.x / SCALE,
-            y: this.smoothCamPos.z / SCALE,
-        });
-        const minCamY = camGround.y + 0.08;
-        if (this.smoothCamPos.y < minCamY) {
-            this.smoothCamPos.y = minCamY;
-        }
-
-        this.threeCamera.position.copy(this.smoothCamPos);
-
-        // =============================================
-        //  6) LOOK-AT — offset by the same shoulder so it's a parallel shift
-        // =============================================
         this.threeCamera.lookAt(
-            target.x + shoulderX,
-            target.y,
-            target.z + shoulderZ,
+            eyeX + sinYaw * cosPitch,
+            eyeY - sinPitch,
+            eyeZ + cosYaw * cosPitch,
         );
     }
 
@@ -884,7 +778,7 @@ class ThreeRenderer implements GameRenderer {
     // =============================================================
 
     private updateInteraction(scene: Scene, dt: number) {
-        if (!this.thirdPerson || !this.threeCamera || !this.interactCanvas) {
+        if (!this.threeCamera || !this.interactCanvas) {
             if (this.interactCanvas) {
                 const ctx2 = this.interactCanvas.getContext('2d');
                 if (ctx2) ctx2.clearRect(0, 0, this.interactCanvas.width, this.interactCanvas.height);
@@ -1061,19 +955,39 @@ class ThreeRenderer implements GameRenderer {
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        if (this.thirdPerson) {
+        {
             const dpr = Math.min(window.devicePixelRatio || 1, 2);
             const cx = canvas.width / 2;
             const cy = canvas.height / 2;
-            const dotR = 2.5 * dpr;
+            const armLen = 6 * dpr;
+            const gap = 2 * dpr;
+            const lw = 1.5 * dpr;
+
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.lineWidth = lw;
             ctx.beginPath();
-            ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-            ctx.fill();
+            ctx.moveTo(cx - gap - armLen, cy); ctx.lineTo(cx - gap, cy);
+            ctx.moveTo(cx + gap, cy); ctx.lineTo(cx + gap + armLen, cy);
+            ctx.moveTo(cx, cy - gap - armLen); ctx.lineTo(cx, cy - gap);
+            ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + gap + armLen);
+            ctx.stroke();
+
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
+            ctx.lineWidth = lw + 1 * dpr;
             ctx.beginPath();
-            ctx.arc(cx, cy, dotR + 1 * dpr, 0, Math.PI * 2);
-            ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
-            ctx.lineWidth = 0.8 * dpr;
+            ctx.moveTo(cx - gap - armLen, cy); ctx.lineTo(cx - gap, cy);
+            ctx.moveTo(cx + gap, cy); ctx.lineTo(cx + gap + armLen, cy);
+            ctx.moveTo(cx, cy - gap - armLen); ctx.lineTo(cx, cy - gap);
+            ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + gap + armLen);
+            ctx.stroke();
+
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.lineWidth = lw;
+            ctx.beginPath();
+            ctx.moveTo(cx - gap - armLen, cy); ctx.lineTo(cx - gap, cy);
+            ctx.moveTo(cx + gap, cy); ctx.lineTo(cx + gap + armLen, cy);
+            ctx.moveTo(cx, cy - gap - armLen); ctx.lineTo(cx, cy - gap);
+            ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + gap + armLen);
             ctx.stroke();
         }
 
@@ -1311,13 +1225,46 @@ class ThreeRenderer implements GameRenderer {
         const fadeEnd = ThreeRenderer.GRASS_RENDER_RADIUS * SCALE * 0.92;
 
         this.grassMat.onBeforeCompile = (shader) => {
+            this.grassShaderRef = shader;
             shader.uniforms.uFadeStart = { value: fadeStart };
             shader.uniforms.uFadeEnd = { value: fadeEnd };
+            shader.uniforms.uWindTime = { value: 0.0 };
 
             shader.vertexShader = shader.vertexShader.replace(
                 'void main() {',
-                'varying float vGrassDist;\nvoid main() {'
+                [
+                    'varying float vGrassDist;',
+                    'uniform float uWindTime;',
+                    '',
+                    'vec2 windDisplace(vec3 wp, float h, float t) {',
+                    '    float mainWave = sin(wp.x * 0.4 + t * 1.8) * cos(wp.z * 0.3 + t * 1.2);',
+                    '    float gust = sin(wp.x * 1.5 + wp.z * 0.9 + t * 4.5) * 0.3;',
+                    '    float detail = sin(wp.x * 3.0 - t * 2.0) * sin(wp.z * 2.5 + t * 3.0) * 0.15;',
+                    '    float strength = (mainWave + gust + detail) * h * h;',
+                    '    float dx = strength * 0.08;',
+                    '    float dz = strength * 0.05 + cos(wp.z * 0.6 + t * 1.5) * h * h * 0.03;',
+                    '    return vec2(dx, dz);',
+                    '}',
+                    '',
+                    'void main() {',
+                ].join('\n')
             );
+
+            shader.vertexShader = shader.vertexShader.replace(
+                '#include <begin_vertex>',
+                [
+                    '#include <begin_vertex>',
+                    '{',
+                    '    vec4 worldInst = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);',
+                    '    float heightFrac = clamp(position.y / 0.8, 0.0, 1.0);',
+                    '    vec2 wd = windDisplace(worldInst.xyz, heightFrac, uWindTime);',
+                    '    transformed.x += wd.x;',
+                    '    transformed.z += wd.y;',
+                    '    transformed.y -= length(wd) * 0.3;',
+                    '}',
+                ].join('\n')
+            );
+
             shader.vertexShader = shader.vertexShader.replace(
                 '#include <fog_vertex>',
                 '#include <fog_vertex>\nvGrassDist = -mvPosition.z;'
@@ -1390,6 +1337,8 @@ class ThreeRenderer implements GameRenderer {
                 const wx = worldX0 + lx + (rand() - 0.5) * STEP * 1.8;
                 const wz = worldZ0 + lz + (rand() - 0.5) * STEP * 1.8;
 
+                if (wx < -WORLD_HALF || wx > WORLD_HALF || wz < -WORLD_HALF || wz > WORLD_HALF) continue;
+
                 const hum = sampleBilinear(soilGrid.layers.humidity, wx, wz);
                 const waterLvl = sampleBilinear(soilGrid.waterLevel, wx, wz);
                 if (waterLvl > 0.08) continue;
@@ -1397,8 +1346,7 @@ class ThreeRenderer implements GameRenderer {
 
                 const humFactor = Math.min(1, Math.max(0, (hum - 0.08) / 0.40));
                 if (rand() > humFactor * humFactor) continue;
-                if (lod === 1 && rand() < 0.15) continue;
-                if (lod === 0 && rand() < 0.08) continue;
+                if (lod === 1 && rand() < 0.12) continue;
 
                 const rawH = getHeightAt(heightMap, wx, wz);
                 if (rawH < SEA_LEVEL + 2) continue;
@@ -2201,7 +2149,7 @@ class ThreeRenderer implements GameRenderer {
         const weatherType = weather?.current ?? 'sunny';
 
         const dayColor = new THREE.Color(0x87ceeb);
-        const nightColor = new THREE.Color(0x0a0a2e);
+        const nightColor = new THREE.Color(0x020208);
         const duskColor = new THREE.Color(0xff7b4f);
 
         let skyColor: THREE.Color;
@@ -2235,7 +2183,9 @@ class ThreeRenderer implements GameRenderer {
                 overcastGrey = new THREE.Color(0x8899aa);
                 strength = 0.3;
             }
-            skyColor.lerp(overcastGrey, strength * (1 - nightFactor * 0.5));
+            const nightDim = Math.max(0, 1 - nightFactor * 0.95);
+            overcastGrey.lerp(new THREE.Color(0x080a10), nightFactor * 0.9);
+            skyColor.lerp(overcastGrey, strength * nightDim);
         }
 
         if (this.lightningFlash > 0) {
@@ -2245,8 +2195,13 @@ class ThreeRenderer implements GameRenderer {
         this.renderer.setClearColor(skyColor);
 
         if (this.threeScene.fog instanceof THREE.Fog) {
-            this.threeScene.fog.color.copy(skyColor);
-            let fogNear = 80, fogFar = 200;
+            const fogColor = skyColor.clone();
+            if (nightFactor > 0) {
+                const nightDark = new THREE.Color(0x020208);
+                fogColor.lerp(nightDark, nightFactor * 0.95);
+            }
+            this.threeScene.fog.color.copy(fogColor);
+            let fogNear = 40, fogFar = 120;
             if (weatherType === 'foggy') { fogNear = 1; fogFar = 12; }
             else if (weatherType === 'stormy') { fogNear = 15; fogFar = 60; }
             else if (weatherType === 'snowy') { fogNear = 20; fogFar = 80; }
@@ -2263,7 +2218,7 @@ class ThreeRenderer implements GameRenderer {
         else if (weatherType === 'rainy') sunMult = 0.35;
         else if (weatherType === 'stormy') sunMult = 0.2;
 
-        this.sunLight.intensity = Math.max(0.08, 1.2 * (1 - nightFactor) * sunMult);
+        this.sunLight.intensity = Math.max(0.01, 1.2 * (1 - nightFactor) * sunMult);
         if (this.lightningFlash > 0) {
             this.sunLight.intensity += this.lightningFlash * 3.5;
         }
@@ -2278,9 +2233,9 @@ class ThreeRenderer implements GameRenderer {
 
         const ambient = this.threeScene.children.find((c) => c instanceof THREE.AmbientLight) as THREE.AmbientLight | undefined;
         if (ambient) {
-            let ambientBase = 0.2 + 0.4 * (1 - nightFactor);
+            let ambientBase = 0.15 + 0.45 * (1 - nightFactor);
             ambientBase *= (sunMult * 0.6 + 0.4);
-            ambientBase = Math.max(0.12, ambientBase);
+            ambientBase = Math.max(0.02, ambientBase);
             if (this.lightningFlash > 0) {
                 ambientBase += this.lightningFlash * 2.5;
             }
@@ -2510,7 +2465,7 @@ class ThreeRenderer implements GameRenderer {
         if (!this.splatTexture) return;
 
         const worldW = (sg.cols - 1) * sg.cellSize * SCALE;
-        const texRepeat = worldW / 0.5;
+        const texRepeat = worldW / 0.25;
 
         const whitePx = new Uint8Array([255, 255, 255, 255]);
         const whiteTex = new THREE.DataTexture(whitePx, 1, 1);

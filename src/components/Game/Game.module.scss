@@ -10,7 +10,7 @@
 }
 
 .RendererContainer {
-  position: absolute;
+  position: fixed !important;
   inset: 0;
   overflow: hidden;
 
@@ -146,7 +146,9 @@
   font-size: 11px;
   color: #aaa;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition:
+    background 0.15s,
+    color 0.15s;
   margin-left: 6px;
 
   &:hover {
