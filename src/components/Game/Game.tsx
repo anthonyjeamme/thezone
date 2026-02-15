@@ -5,7 +5,7 @@ import classNameModule from '@anthonyjeamme/classname';
 import styles from './Game.module.scss';
 import { processWorld } from '../World/simulation';
 import { processAI } from '../AI/brain';
-import { BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_DAY, SECONDS_PER_HOUR, WORLD_HALF, Scene, getCalendar, getLifeStage } from '../World/types';
+import { AnimalEntity, BuildingEntity, Calendar, Camera, CorpseEntity, FertileZoneEntity, Highlight, KnownZone, NPCEntity, NPCTraits, PlantEntity, SECONDS_PER_DAY, SECONDS_PER_HOUR, WORLD_HALF, Scene, getCalendar, getLifeStage } from '../World/types';
 import { getItemDef } from '../Shared/registry';
 import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from '../World/terrain';
 import { generateEntityId } from '../Shared/ids';
@@ -354,6 +354,111 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
     }
 }
 
+function generateDenseForests(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap) {
+    const MARGIN = 150;
+
+    const forestDefs: { species: string[]; count: number; radius: number; treesPerForest: number; humMin: number }[] = [
+        { species: ['oak', 'birch'],          count: 6,  radius: 80,  treesPerForest: 60, humMin: 0.30 },
+        { species: ['pine'],                  count: 5,  radius: 100, treesPerForest: 70, humMin: 0.15 },
+        { species: ['oak', 'pine', 'birch'],  count: 4,  radius: 120, treesPerForest: 80, humMin: 0.25 },
+        { species: ['willow'],                count: 3,  radius: 50,  treesPerForest: 25, humMin: 0.55 },
+        { species: ['apple', 'cherry'],       count: 3,  radius: 60,  treesPerForest: 30, humMin: 0.30 },
+    ];
+
+    for (const def of forestDefs) {
+        for (let f = 0; f < def.count; f++) {
+            let centerX = 0, centerY = 0, valid = false;
+            for (let attempt = 0; attempt < 50; attempt++) {
+                centerX = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+                centerY = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+                if (getHeightAt(heightMap, centerX, centerY) < SEA_LEVEL + 5) continue;
+                const col = Math.floor((centerX - soilGrid.originX) / soilGrid.cellSize);
+                const row = Math.floor((centerY - soilGrid.originY) / soilGrid.cellSize);
+                if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
+                const hum = soilGrid.layers.humidity[row * soilGrid.cols + col];
+                if (hum < def.humMin) continue;
+                valid = true;
+                break;
+            }
+            if (!valid) continue;
+
+            for (let t = 0; t < def.treesPerForest; t++) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = Math.sqrt(Math.random()) * def.radius;
+                const tx = centerX + Math.cos(angle) * dist;
+                const ty = centerY + Math.sin(angle) * dist;
+
+                if (tx < -WORLD_HALF + 50 || tx > WORLD_HALF - 50) continue;
+                if (ty < -WORLD_HALF + 50 || ty > WORLD_HALF - 50) continue;
+                if (getHeightAt(heightMap, tx, ty) < SEA_LEVEL + 3) continue;
+
+                const speciesId = def.species[Math.floor(Math.random() * def.species.length)];
+                const growth = 0.7 + Math.random() * 0.3;
+
+                const plant: PlantEntity = {
+                    id: `plant-${generateEntityId()}`,
+                    type: 'plant',
+                    speciesId,
+                    position: { x: tx, y: ty },
+                    growth,
+                    health: 100,
+                    age: growth * SECONDS_PER_DAY * 8,
+                    stage: growth >= 0.85 ? 'mature' : 'growing',
+                    seedTimer: Math.random() * SECONDS_PER_DAY * 2,
+                    fruitTimer: Math.random() * SECONDS_PER_DAY * 2,
+                    dormancyTimer: 0,
+                };
+                entities.push(plant);
+            }
+        }
+    }
+}
+
+function generateInitialAnimals(entities: Scene['entities'], heightMap: import('../World/heightmap').HeightMap) {
+    const MARGIN = 100;
+    const animalSetup: { id: 'rabbit' | 'deer' | 'fox' | 'wolf'; count: number }[] = [
+        { id: 'rabbit', count: 40 },
+        { id: 'deer',   count: 20 },
+        { id: 'fox',    count: 8 },
+        { id: 'wolf',   count: 5 },
+    ];
+
+    for (const setup of animalSetup) {
+        let placed = 0;
+        let attempts = 0;
+        const maxAttempts = setup.count * 30;
+
+        while (placed < setup.count && attempts < maxAttempts) {
+            attempts++;
+            const x = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+            const y = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
+            if (getHeightAt(heightMap, x, y) < SEA_LEVEL + 3) continue;
+
+            const growth = 0.5 + Math.random() * 0.5;
+            const animal: AnimalEntity = {
+                id: `animal-${generateEntityId()}`,
+                type: 'animal',
+                speciesId: setup.id,
+                position: { x, y },
+                targetPos: null,
+                heading: Math.random() * Math.PI * 2,
+                speed: 0,
+                health: 100,
+                hunger: Math.random() * 0.3,
+                age: growth * SECONDS_PER_DAY * 10,
+                growth,
+                reproTimer: SECONDS_PER_DAY * (2 + Math.random() * 5),
+                idleTimer: SECONDS_PER_DAY * (0.5 + Math.random() * 2),
+                mateTargetId: null,
+                sex: Math.random() < 0.5 ? 'male' : 'female',
+                state: 'idle',
+            };
+            entities.push(animal);
+            placed++;
+        }
+    }
+}
+
 function createInitialScene(): Scene {
     const entities: Scene['entities'] = [];
 
@@ -385,6 +490,9 @@ function createInitialScene(): Scene {
     // Scatter initial plants across the map
     generateTestPlants(entities, soilGrid, heightMap);
 
+    // Dense forest clusters
+    generateDenseForests(entities, soilGrid, heightMap);
+
     // Spawn raspberry bushes near player start (0,0) for testing
     for (let i = 0; i < 6; i++) {
         const angle = (i / 6) * Math.PI * 2;
@@ -405,6 +513,8 @@ function createInitialScene(): Scene {
             dormancyTimer: 0,
         });
     }
+
+    generateInitialAnimals(entities, heightMap);
 
     const weather = createWeatherState();
     const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true };

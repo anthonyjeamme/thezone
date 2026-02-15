@@ -6,11 +6,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GameRenderer, registerRenderer } from '../GameRenderer';
 import {
-    BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity,
+    AnimalEntity, BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity,
     Highlight, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity,
     getCalendar, getLifeStage, LifeStage, WORLD_HALF,
 } from '../../World/types';
 import { getSpecies } from '../../World/flora';
+import { getAnimalSpecies } from '../../World/fauna';
 import { Vector2D } from '../../Shared/vector';
 import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
 import type { SoilGrid, SoilProperty } from '../../World/fertility';
@@ -298,6 +299,7 @@ class ThreeRenderer implements GameRenderer {
     private clock = new THREE.Clock();
 
     // Entity mesh pools
+    private animalMeshes = new Map<string, THREE.Group>();
     private npcMeshes = new Map<string, THREE.Group>();
     private buildingMeshes = new Map<string, THREE.Group>();
     private resourceMeshes = new Map<string, THREE.Object3D>();
@@ -633,6 +635,7 @@ class ThreeRenderer implements GameRenderer {
         // --- Sync entities ---
         this.syncPlants(scene);
         this.syncFruits(scene);
+        this.syncAnimals(scene, elapsed);
         this.syncNPCs(scene, elapsed, highlight);
         this.syncBuildings(scene);
         this.syncResources(scene);
@@ -1111,6 +1114,11 @@ class ThreeRenderer implements GameRenderer {
         for (const mat of this.fruitMatCache.values()) mat.dispose();
         this.fruitMatCache.clear();
 
+        for (const mesh of this.animalMeshes.values()) {
+            this.threeScene!.remove(mesh);
+            this.disposeObject(mesh);
+        }
+        this.animalMeshes.clear();
         this.npcMeshes.clear();
         this.buildingMeshes.clear();
         this.resourceMeshes.clear();
@@ -1895,6 +1903,268 @@ class ThreeRenderer implements GameRenderer {
                 this.threeScene!.remove(mesh);
                 mesh.dispose();
                 this.fruitInstances.delete(key);
+            }
+        }
+    }
+
+    private static buildRabbitModel(color: string): THREE.Group {
+        const g = new THREE.Group();
+        const mat = new THREE.MeshLambertMaterial({ color });
+
+        const body = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 6), mat);
+        body.scale.set(1, 0.8, 1.3);
+        body.position.y = 0.06;
+        body.castShadow = true;
+        g.add(body);
+
+        const headMat = new THREE.MeshLambertMaterial({ color: '#c0a080' });
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 6), headMat);
+        head.position.set(0, 0.09, 0.07);
+        head.castShadow = true;
+        g.add(head);
+
+        const earMat = new THREE.MeshLambertMaterial({ color: '#d4b896' });
+        for (const side of [-1, 1]) {
+            const ear = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.012, 0.06, 5), earMat);
+            ear.position.set(side * 0.02, 0.15, 0.06);
+            ear.rotation.z = side * 0.2;
+            g.add(ear);
+        }
+
+        const tailMat = new THREE.MeshLambertMaterial({ color: '#e0d0c0' });
+        const tail = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 6), tailMat);
+        tail.position.set(0, 0.06, -0.09);
+        g.add(tail);
+
+        return g;
+    }
+
+    private static buildDeerModel(color: string): THREE.Group {
+        const g = new THREE.Group();
+        const mat = new THREE.MeshLambertMaterial({ color });
+
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.22, 8), mat);
+        body.rotation.x = Math.PI / 2;
+        body.position.set(0, 0.18, 0);
+        body.castShadow = true;
+        g.add(body);
+
+        const headMat = new THREE.MeshLambertMaterial({ color: '#a08050' });
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 6), headMat);
+        head.position.set(0, 0.24, 0.12);
+        head.castShadow = true;
+        g.add(head);
+
+        const legMat = new THREE.MeshLambertMaterial({ color: '#7a5c32' });
+        const legPositions = [
+            { x: -0.04, z: 0.06 }, { x: 0.04, z: 0.06 },
+            { x: -0.04, z: -0.06 }, { x: 0.04, z: -0.06 },
+        ];
+        for (const lp of legPositions) {
+            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.01, 0.14, 5), legMat);
+            leg.position.set(lp.x, 0.07, lp.z);
+            leg.castShadow = true;
+            g.add(leg);
+        }
+
+        const antlerMat = new THREE.MeshLambertMaterial({ color: '#6b5030' });
+        for (const side of [-1, 1]) {
+            const antler = new THREE.Mesh(new THREE.CylinderGeometry(0.005, 0.008, 0.08, 4), antlerMat);
+            antler.position.set(side * 0.025, 0.30, 0.11);
+            antler.rotation.z = side * 0.4;
+            antler.rotation.x = -0.3;
+            g.add(antler);
+
+            const branch = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.005, 0.04, 4), antlerMat);
+            branch.position.set(side * 0.04, 0.34, 0.10);
+            branch.rotation.z = side * 0.8;
+            g.add(branch);
+        }
+
+        return g;
+    }
+
+    private static buildFoxModel(color: string): THREE.Group {
+        const g = new THREE.Group();
+        const mat = new THREE.MeshLambertMaterial({ color });
+
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, 0.16, 8), mat);
+        body.rotation.x = Math.PI / 2;
+        body.position.set(0, 0.1, 0);
+        body.castShadow = true;
+        g.add(body);
+
+        const headMat = new THREE.MeshLambertMaterial({ color: '#d06020' });
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), headMat);
+        head.position.set(0, 0.13, 0.09);
+        head.castShadow = true;
+        g.add(head);
+
+        const snout = new THREE.Mesh(new THREE.ConeGeometry(0.015, 0.04, 6), headMat);
+        snout.rotation.x = -Math.PI / 2;
+        snout.position.set(0, 0.12, 0.12);
+        g.add(snout);
+
+        const earMat = new THREE.MeshLambertMaterial({ color: '#e07030' });
+        for (const side of [-1, 1]) {
+            const ear = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.03, 4), earMat);
+            ear.position.set(side * 0.02, 0.17, 0.08);
+            g.add(ear);
+        }
+
+        const tailMat = new THREE.MeshLambertMaterial({ color: '#e8a060' });
+        const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.025, 0.1, 6), tailMat);
+        tail.rotation.x = Math.PI / 2 + 0.5;
+        tail.position.set(0, 0.1, -0.11);
+        g.add(tail);
+
+        const whiteTip = new THREE.Mesh(new THREE.SphereGeometry(0.012, 6, 6), new THREE.MeshLambertMaterial({ color: '#ffffff' }));
+        whiteTip.position.set(0, 0.13, -0.15);
+        g.add(whiteTip);
+
+        const legMat = new THREE.MeshLambertMaterial({ color: '#2a2a2a' });
+        for (const lp of [{ x: -0.025, z: 0.04 }, { x: 0.025, z: 0.04 }, { x: -0.025, z: -0.04 }, { x: 0.025, z: -0.04 }]) {
+            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.006, 0.08, 5), legMat);
+            leg.position.set(lp.x, 0.04, lp.z);
+            g.add(leg);
+        }
+
+        return g;
+    }
+
+    private static buildWolfModel(color: string): THREE.Group {
+        const g = new THREE.Group();
+        const mat = new THREE.MeshLambertMaterial({ color });
+
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.06, 0.2, 8), mat);
+        body.rotation.x = Math.PI / 2;
+        body.position.set(0, 0.14, 0);
+        body.castShadow = true;
+        g.add(body);
+
+        const headMat = new THREE.MeshLambertMaterial({ color: '#666677' });
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6), headMat);
+        head.position.set(0, 0.18, 0.11);
+        head.castShadow = true;
+        g.add(head);
+
+        const snout = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.05, 6), headMat);
+        snout.rotation.x = -Math.PI / 2;
+        snout.position.set(0, 0.16, 0.15);
+        g.add(snout);
+
+        const earMat = new THREE.MeshLambertMaterial({ color: '#555566' });
+        for (const side of [-1, 1]) {
+            const ear = new THREE.Mesh(new THREE.ConeGeometry(0.015, 0.035, 4), earMat);
+            ear.position.set(side * 0.025, 0.23, 0.10);
+            g.add(ear);
+        }
+
+        const tailMat = new THREE.MeshLambertMaterial({ color: '#555566' });
+        const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.025, 0.12, 6), tailMat);
+        tail.rotation.x = Math.PI / 2 + 0.6;
+        tail.position.set(0, 0.14, -0.13);
+        g.add(tail);
+
+        const legMat = new THREE.MeshLambertMaterial({ color: '#444455' });
+        for (const lp of [{ x: -0.03, z: 0.05 }, { x: 0.03, z: 0.05 }, { x: -0.03, z: -0.05 }, { x: 0.03, z: -0.05 }]) {
+            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.01, 0.11, 5), legMat);
+            leg.position.set(lp.x, 0.055, lp.z);
+            g.add(leg);
+        }
+
+        return g;
+    }
+
+    private static buildAnimalModel(speciesId: string, color: string): THREE.Group {
+        switch (speciesId) {
+            case 'rabbit': return ThreeRenderer.buildRabbitModel(color);
+            case 'deer': return ThreeRenderer.buildDeerModel(color);
+            case 'fox': return ThreeRenderer.buildFoxModel(color);
+            case 'wolf': return ThreeRenderer.buildWolfModel(color);
+            default: return ThreeRenderer.buildRabbitModel(color);
+        }
+    }
+
+    private syncAnimals(scene: Scene, elapsed: number) {
+        const animals = scene.entities.filter((e): e is AnimalEntity => e.type === 'animal');
+        const activeIds = new Set(animals.map((a) => a.id));
+
+        for (const [id, mesh] of this.animalMeshes) {
+            if (!activeIds.has(id)) {
+                this.threeScene!.remove(mesh);
+                this.disposeObject(mesh);
+                this.animalMeshes.delete(id);
+            }
+        }
+
+        for (const animal of animals) {
+            const species = getAnimalSpecies(animal.speciesId);
+            if (!species) continue;
+
+            let group = this.animalMeshes.get(animal.id);
+            if (!group) {
+                group = ThreeRenderer.buildAnimalModel(animal.speciesId, species.color);
+                this.threeScene!.add(group);
+                this.animalMeshes.set(animal.id, group);
+            }
+
+            const pos = toWorld(animal.position);
+            group.position.set(pos.x, pos.y, pos.z);
+
+            group.rotation.y = -animal.heading + Math.PI / 2;
+
+            const scale = 0.4 + animal.growth * 0.6;
+            group.scale.setScalar(scale);
+
+            if (animal.state === 'dead') {
+                group.rotation.z = Math.PI / 2;
+                group.rotation.x = 0;
+                group.position.y = pos.y + 0.02;
+                const fade = Math.max(0.1, 1 - (animal.age / (5 * 240)));
+                group.traverse((child) => {
+                    if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshLambertMaterial) {
+                        child.material.transparent = true;
+                        child.material.opacity = fade;
+                    }
+                });
+            } else if (animal.state === 'sleeping') {
+                group.rotation.z = Math.PI / 2;
+                group.rotation.x = 0;
+                group.position.y = pos.y + 0.01;
+                const breathe = 1 + Math.sin(elapsed * 1.5 + animal.id.charCodeAt(0)) * 0.02;
+                group.scale.setScalar(scale * breathe);
+                group.traverse((child) => {
+                    if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshLambertMaterial) {
+                        child.material.transparent = false;
+                        child.material.opacity = 1;
+                    }
+                });
+            } else {
+                group.rotation.z = 0;
+
+                if (animal.state === 'grazing') {
+                    group.rotation.x = 0.25;
+                    group.position.y = pos.y - 0.01;
+                } else if (animal.state === 'calling') {
+                    group.rotation.x = -0.2;
+                    group.position.y = pos.y;
+                } else {
+                    group.rotation.x = 0;
+                }
+
+                if (animal.state === 'wandering' || animal.state === 'eating' || animal.state === 'fleeing' || animal.state === 'mating') {
+                    const bobSpeed = animal.state === 'fleeing' ? 14 : 5;
+                    const bobAmp = animal.speciesId === 'rabbit' ? 0.012 : 0.004;
+                    group.position.y = pos.y + Math.abs(Math.sin(elapsed * bobSpeed + animal.id.charCodeAt(0))) * bobAmp;
+                }
+
+                group.traverse((child) => {
+                    if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshLambertMaterial) {
+                        child.material.transparent = false;
+                        child.material.opacity = 1;
+                    }
+                });
             }
         }
     }

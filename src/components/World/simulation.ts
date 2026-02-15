@@ -17,6 +17,7 @@ import { generateEntityId } from '../Shared/ids';
 import { logger } from '../Shared/logger';
 import { findCabinSlot, generateCabinPlot, refreshNearbyPlots } from './terrain';
 import { processFlora } from './flora';
+import { processFauna } from './fauna';
 import { processWeather } from './weather';
 import { processSoilCycles } from './fertility';
 import {
@@ -81,6 +82,7 @@ export function processWorld(scene: Scene, dt: number) {
     processWeather(scene, dt);
     if (scene.soilGrid) processSoilCycles(scene.soilGrid, dt, scene.heightMap);
     processFlora(scene, dt);
+    processFauna(scene, dt);
 }
 
 // --- World API (per-NPC interface) ---

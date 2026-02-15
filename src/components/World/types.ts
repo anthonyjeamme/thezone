@@ -492,9 +492,32 @@ export type FruitEntity = {
     parentPlantId?: string;
 };
 
+// --- Animal Entity ---
+
+export type AnimalSpeciesId = 'rabbit' | 'deer' | 'wolf' | 'fox';
+
+export type AnimalEntity = {
+    id: string;
+    type: 'animal';
+    speciesId: AnimalSpeciesId;
+    position: Vector2D;
+    targetPos: Vector2D | null;
+    heading: number;
+    speed: number;
+    health: number;
+    hunger: number;
+    age: number;
+    growth: number;
+    reproTimer: number;
+    idleTimer: number;
+    sex: 'male' | 'female';
+    mateTargetId: string | null;
+    state: 'idle' | 'wandering' | 'eating' | 'grazing' | 'fleeing' | 'sleeping' | 'calling' | 'mating' | 'dead';
+};
+
 // --- Scene ---
 
-export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity | PlantEntity | FruitEntity;
+export type SceneEntity = NPCEntity | ResourceEntity | StockEntity | BuildingEntity | CorpseEntity | FertileZoneEntity | PlantEntity | FruitEntity | AnimalEntity;
 
 export type Scene = {
     entities: SceneEntity[];
