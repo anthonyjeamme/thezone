@@ -102,10 +102,10 @@ registerSpecies({
     growthDays: 10,        // was 2 — more realistic, still fast for a tree
     resilience: 0.8,
     seedSpread: {
-        minGrowth: 0.85,       // doit être quasi-mature
-        seedCount: 2,          // glands
-        intervalDays: 7,       // tous les 7 jours
-        radius: 120,           // tombent pas loin (gravité)
+        minGrowth: 0.75,
+        seedCount: 4,
+        intervalDays: 4,
+        radius: 120,
     },
     fruitProduction: {
         fruitName: 'Gland',
@@ -213,12 +213,12 @@ registerSpecies({
     color: '#3a6e3a',
     matureColor: '#1e4d2b',
     maxSize: 15,
-    growthDays: 40,        // was 70 — still slow but not unreasonably so
+    growthDays: 20,
     resilience: 0.7,
     seedSpread: {
-        minGrowth: 0.85,
-        seedCount: 2,          // pommes de pin
-        intervalDays: 8,
+        minGrowth: 0.70,
+        seedCount: 5,
+        intervalDays: 3,
         radius: 100,
     },
     fruitProduction: {
@@ -249,10 +249,10 @@ registerSpecies({
     growthDays: 20,
     resilience: 0.65,
     seedSpread: {
-        minGrowth: 0.7,
-        seedCount: 2,          // small seeds (wind-dispersed)
-        intervalDays: 5,
-        radius: 140,           // light seeds travel far
+        minGrowth: 0.65,
+        seedCount: 4,
+        intervalDays: 3,
+        radius: 140,
     },
 });
 
@@ -366,15 +366,14 @@ registerSpecies({
     color: '#6aaa5a',
     matureColor: '#4a8a3a',
     maxSize: 16,
-    growthDays: 40,
+    growthDays: 20,
     resilience: 0.75,
     seedSpread: {
-        minGrowth: 0.8,
-        seedCount: 3,
-        intervalDays: 6,
+        minGrowth: 0.65,
+        seedCount: 5,
+        intervalDays: 3,
         radius: 90,
     },
-    // No fruit — willow doesn't produce edible fruits
 });
 
 // --- Zone humide: Roseau ---
@@ -414,13 +413,13 @@ registerSpecies({
     color: '#5a8a4a',
     matureColor: '#3a6a2a',
     maxSize: 12,
-    growthDays: 30,
+    growthDays: 18,
     resilience: 0.6,
     seedSpread: {
-        minGrowth: 0.85,
-        seedCount: 2,          // few seeds (from eaten apples)
-        intervalDays: 6,
-        radius: 80,            // animals carry seeds
+        minGrowth: 0.70,
+        seedCount: 4,
+        intervalDays: 3,
+        radius: 80,
     },
     fruitProduction: {
         fruitName: 'Pomme',
@@ -447,13 +446,13 @@ registerSpecies({
     color: '#6a8a5a',
     matureColor: '#4a6a3a',
     maxSize: 11,
-    growthDays: 25,
+    growthDays: 15,
     resilience: 0.55,
     seedSpread: {
-        minGrowth: 0.85,
-        seedCount: 3,
-        intervalDays: 5,
-        radius: 90,            // birds carry cherry seeds far
+        minGrowth: 0.70,
+        seedCount: 4,
+        intervalDays: 3,
+        radius: 90,
     },
     fruitProduction: {
         fruitName: 'Cerise',
@@ -677,7 +676,7 @@ function queryNearby(grid: SpatialGrid, x: number, y: number, radius: number, ex
 const CROWD_RADIUS_BASE = 40; // px — scaled by species maxSize
 
 /** Max neighbor count before growth starts to be penalized */
-const CROWD_MAX_NEIGHBORS = 3;
+const CROWD_MAX_NEIGHBORS = 6;
 
 /**
  * Count how many living plants are within crowding radius of a given plant.
@@ -700,17 +699,17 @@ function getCrowdingFactor(plant: PlantEntity, species: PlantSpecies): number {
 // =============================================================
 
 /** Minimum fertility for a seed to germinate */
-const GERMINATION_MIN_FERTILITY = 0.25;
+const GERMINATION_MIN_FERTILITY = 0.15;
 
 /** Max dormancy time in game days — after this, seed dies if soil is still bad */
-const MAX_DORMANCY_DAYS = 1.5;
+const MAX_DORMANCY_DAYS = 4;
 
 // =============================================================
 //  DENSITY CAP — prevent over-seeding in a small area
 // =============================================================
 
 /** Max same-species plants allowed in seed radius before blocking new seeds */
-const DENSITY_CAP = 4;
+const DENSITY_CAP = 12;
 
 /**
  * Check if an area already has too many plants of the same species.

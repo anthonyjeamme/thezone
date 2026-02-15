@@ -290,29 +290,29 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
 
     // Species configs: id, count, preferred humidity range, growth range
     const speciesSetup: { id: string; count: number; humRange: [number, number]; growthRange: [number, number] }[] = [
-        // Forest
-        { id: 'oak',        count: 20, humRange: [0.35, 0.80], growthRange: [0.0, 1.0] },
-        { id: 'pine',       count: 18, humRange: [0.20, 0.60], growthRange: [0.0, 1.0] },
-        { id: 'birch',      count: 15, humRange: [0.30, 0.70], growthRange: [0.0, 1.0] },
-        { id: 'mushroom',   count: 12, humRange: [0.50, 0.85], growthRange: [0.0, 0.9] },
+        // Forest — dense initial forests
+        { id: 'oak',        count: 120, humRange: [0.30, 0.85], growthRange: [0.5, 1.0] },
+        { id: 'pine',       count: 100, humRange: [0.15, 0.65], growthRange: [0.5, 1.0] },
+        { id: 'birch',      count: 80,  humRange: [0.25, 0.75], growthRange: [0.5, 1.0] },
+        { id: 'mushroom',   count: 40,  humRange: [0.50, 0.85], growthRange: [0.3, 0.9] },
         // Meadow
-        { id: 'wheat',      count: 25, humRange: [0.35, 0.65], growthRange: [0.0, 0.9] },
-        { id: 'wildflower', count: 18, humRange: [0.25, 0.70], growthRange: [0.0, 0.8] },
-        { id: 'thyme',      count: 12, humRange: [0.10, 0.40], growthRange: [0.0, 0.9] },
-        { id: 'sage',       count: 10, humRange: [0.15, 0.45], growthRange: [0.0, 0.9] },
+        { id: 'wheat',      count: 60,  humRange: [0.30, 0.70], growthRange: [0.2, 0.9] },
+        { id: 'wildflower', count: 50,  humRange: [0.20, 0.75], growthRange: [0.2, 0.8] },
+        { id: 'thyme',      count: 30,  humRange: [0.08, 0.45], growthRange: [0.3, 0.9] },
+        { id: 'sage',       count: 25,  humRange: [0.10, 0.50], growthRange: [0.3, 0.9] },
         // Wetland
-        { id: 'willow',     count: 8,  humRange: [0.65, 1.00], growthRange: [0.0, 1.0] },
-        { id: 'reed',       count: 15, humRange: [0.75, 1.00], growthRange: [0.0, 0.8] },
-        // Fruit trees
-        { id: 'raspberry',  count: 15, humRange: [0.40, 0.75], growthRange: [0.0, 1.0] },
-        { id: 'apple',      count: 10, humRange: [0.40, 0.70], growthRange: [0.0, 1.0] },
-        { id: 'cherry',     count: 10, humRange: [0.35, 0.65], growthRange: [0.0, 1.0] },
+        { id: 'willow',     count: 30,  humRange: [0.60, 1.00], growthRange: [0.5, 1.0] },
+        { id: 'reed',       count: 50,  humRange: [0.70, 1.00], growthRange: [0.3, 0.8] },
+        // Fruit trees & bushes
+        { id: 'raspberry',  count: 50,  humRange: [0.35, 0.80], growthRange: [0.4, 1.0] },
+        { id: 'apple',      count: 40,  humRange: [0.35, 0.75], growthRange: [0.5, 1.0] },
+        { id: 'cherry',     count: 35,  humRange: [0.30, 0.70], growthRange: [0.5, 1.0] },
     ];
 
     for (const setup of speciesSetup) {
         let placed = 0;
         let attempts = 0;
-        const maxAttempts = setup.count * 10;
+        const maxAttempts = setup.count * 30;
 
         while (placed < setup.count && attempts < maxAttempts) {
             attempts++;
