@@ -5,6 +5,7 @@
 import { computePlantFertility, getSoilAt, getSoilTypeAt, setSoilPropertyAt, SOIL_PROPERTIES, type PlantSoilNeeds, type SoilGrid } from './fertility';
 import { SECONDS_PER_DAY, isInWorldBounds, type FruitEntity, type PlantEntity, type PlantGrowthStage, type Scene } from './types';
 import { generateEntityId } from '../Shared/ids';
+import { getWaterDepthAt } from './heightmap';
 
 // =============================================================
 //  TIME HELPERS — express durations in game days
@@ -801,11 +802,12 @@ function tryDisperse(scene: Scene, plant: PlantEntity, species: PlantSpecies, dt
         // Don't drop seeds outside the world
         if (!isInWorldBounds(seedPos.x, seedPos.y)) continue;
 
-        // Don't drop seeds into water
+        // Don't drop seeds into water or near lakes
         if (scene.lakesEnabled && scene.soilGrid) {
             const idx = cellIndex(scene.soilGrid, seedPos.x, seedPos.y);
             if (idx >= 0 && scene.soilGrid.waterLevel[idx] > 0.3) continue;
         }
+        if (scene.lakeMap && scene.heightMap && getWaterDepthAt(scene.lakeMap, scene.heightMap, seedPos.x, seedPos.y, 3) > 0) continue;
 
         const seed: PlantEntity = {
             id: `plant-${generateEntityId()}`,

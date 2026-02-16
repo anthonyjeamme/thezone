@@ -619,3 +619,181 @@ export function getWaterSurfaceElevation(dep: Depression): number {
     const t = (vol - prevVol) / (nextVol - prevVol);
     return prevElev + t * (nextElev - prevElev);
 }
+
+// =============================================================
+//  LAKES — Pre-computed static water bodies
+//  Generated once from depression map. Each lake has a fixed
+//  water surface elevation and a polygon boundary.
+// =============================================================
+
+export type Lake = {
+    id: number;
+    waterElevation: number;
+    cells: number[];
+    minCol: number;
+    maxCol: number;
+    minRow: number;
+    maxRow: number;
+};
+
+export type LakeMap = {
+    lakes: Lake[];
+    cellLake: Int32Array;
+    cols: number;
+    rows: number;
+    cellSize: number;
+    originX: number;
+    originY: number;
+};
+
+export function generateLakes(heightMap: HeightMap, depressionMap: DepressionMap): LakeMap {
+    const { cols, rows, data: heights, cellSize, originX, originY } = heightMap;
+    const { cellDepression, depressions } = depressionMap;
+    const count = cols * rows;
+    const cellLake = new Int32Array(count).fill(-1);
+    const lakes: Lake[] = [];
+
+    const MIN_LAKE_CELLS = 20;
+    const MIN_LAKE_DEPTH = 2;
+    const FILL_RATIO = 0.65;
+    const MAX_LAKES = 8;
+    const MIN_DISTANCE = 300;
+
+    type Candidate = {
+        dep: Depression;
+        waterElev: number;
+        lakeCells: number[];
+        depth: number;
+        centerX: number;
+        centerY: number;
+        minCol: number; maxCol: number; minRow: number; maxRow: number;
+    };
+    const candidates: Candidate[] = [];
+
+    for (const dep of depressions) {
+        if (dep.volumeCapacity <= 0) continue;
+
+        const sinkH = heights[dep.sinkIdx];
+        if (sinkH < SEA_LEVEL + 1) continue;
+
+        dep.waterVolume = dep.volumeCapacity * FILL_RATIO;
+        const waterElev = getWaterSurfaceElevation(dep);
+        if (waterElev <= -Infinity) continue;
+
+        const lakeCells: number[] = [];
+        for (let i = 0; i < count; i++) {
+            if (cellDepression[i] === dep.id && heights[i] < waterElev) {
+                lakeCells.push(i);
+            }
+        }
+
+        if (lakeCells.length < MIN_LAKE_CELLS) continue;
+
+        const maxDepth = waterElev - heights[dep.sinkIdx];
+        if (maxDepth < MIN_LAKE_DEPTH) continue;
+
+        let minC = cols, maxC = 0, minR = rows, maxR = 0;
+        let sumC = 0, sumR = 0;
+        for (const ci of lakeCells) {
+            const r = Math.floor(ci / cols);
+            const c = ci % cols;
+            if (c < minC) minC = c;
+            if (c > maxC) maxC = c;
+            if (r < minR) minR = r;
+            if (r > maxR) maxR = r;
+            sumC += c;
+            sumR += r;
+        }
+        const cx = originX + (sumC / lakeCells.length) * cellSize;
+        const cy = originY + (sumR / lakeCells.length) * cellSize;
+
+        candidates.push({
+            dep, waterElev, lakeCells, depth: maxDepth,
+            centerX: cx, centerY: cy,
+            minCol: minC, maxCol: maxC, minRow: minR, maxRow: maxR,
+        });
+    }
+
+    candidates.sort((a, b) => b.lakeCells.length - a.lakeCells.length);
+
+    const selected: Candidate[] = [];
+    for (const c of candidates) {
+        if (selected.length >= MAX_LAKES) break;
+
+        let tooClose = false;
+        for (const s of selected) {
+            const dx = c.centerX - s.centerX;
+            const dy = c.centerY - s.centerY;
+            if (dx * dx + dy * dy < MIN_DISTANCE * MIN_DISTANCE) {
+                tooClose = true;
+                break;
+            }
+        }
+        if (tooClose) continue;
+
+        selected.push(c);
+    }
+
+    for (const sel of selected) {
+        const lakeId = lakes.length;
+        for (const ci of sel.lakeCells) {
+            cellLake[ci] = lakeId;
+        }
+        lakes.push({
+            id: lakeId,
+            waterElevation: sel.waterElev,
+            cells: sel.lakeCells,
+            minCol: sel.minCol,
+            maxCol: sel.maxCol,
+            minRow: sel.minRow,
+            maxRow: sel.maxRow,
+        });
+    }
+
+    console.log(`[lakes] Generated ${lakes.length} lakes (from ${candidates.length} candidates)`);
+    for (const l of lakes) {
+        console.log(`  #${l.id}: ${l.cells.length} cells, elevation ${l.waterElevation.toFixed(1)}`);
+    }
+
+    return { lakes, cellLake, cols, rows, cellSize, originX, originY };
+}
+
+export function getLakeAt(lakeMap: LakeMap, worldX: number, worldY: number): Lake | null {
+    const col = Math.round((worldX - lakeMap.originX) / lakeMap.cellSize);
+    const row = Math.round((worldY - lakeMap.originY) / lakeMap.cellSize);
+    if (col < 0 || col >= lakeMap.cols || row < 0 || row >= lakeMap.rows) return null;
+    const idx = row * lakeMap.cols + col;
+    const lakeId = lakeMap.cellLake[idx];
+    if (lakeId < 0) return null;
+    return lakeMap.lakes[lakeId];
+}
+
+export function getWaterDepthAt(
+    lakeMap: LakeMap,
+    heightMap: HeightMap,
+    worldX: number,
+    worldY: number,
+    shoreBuffer: number,
+): number {
+    const cs = lakeMap.cellSize;
+    const col = Math.round((worldX - lakeMap.originX) / cs);
+    const row = Math.round((worldY - lakeMap.originY) / cs);
+    const terrainH = getHeightAt(heightMap, worldX, worldY);
+
+    const radius = Math.ceil(shoreBuffer / cs) + 1;
+    let bestDepth = -Infinity;
+
+    for (let dr = -radius; dr <= radius; dr++) {
+        for (let dc = -radius; dc <= radius; dc++) {
+            const r = row + dr;
+            const c = col + dc;
+            if (r < 0 || r >= lakeMap.rows || c < 0 || c >= lakeMap.cols) continue;
+            const lakeId = lakeMap.cellLake[r * lakeMap.cols + c];
+            if (lakeId < 0) continue;
+            const waterElev = lakeMap.lakes[lakeId].waterElevation;
+            const depth = waterElev + shoreBuffer - terrainH;
+            if (depth > bestDepth) bestDepth = depth;
+        }
+    }
+    return bestDepth;
+}

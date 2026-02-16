@@ -528,6 +528,7 @@ export type Scene = {
     heightMap?: import('./heightmap').HeightMap;    // terrain elevation
     basinMap?: import('./heightmap').BasinMap;     // flow accumulation (derived from heightmap)
     depressionMap?: import('./heightmap').DepressionMap; // topographic depressions for lake sim
+    lakeMap?: import('./heightmap').LakeMap;             // static pre-computed lakes
     weather?: import('./weather').WeatherState;    // current weather conditions
     lakesEnabled: boolean;                          // toggle lakes feature on/off
     signals?: import('./signals').Signal[];          // active world signals

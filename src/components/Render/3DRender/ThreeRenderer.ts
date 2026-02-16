@@ -15,8 +15,8 @@ import { getAnimalSpecies } from '../../World/fauna';
 import { Vector2D } from '../../Shared/vector';
 import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
 import type { SoilGrid, SoilProperty } from '../../World/fertility';
-import { SEA_LEVEL } from '../../World/heightmap';
-import type { HeightMap, BasinMap } from '../../World/heightmap';
+import { SEA_LEVEL, getLakeAt, getWaterDepthAt } from '../../World/heightmap';
+import type { HeightMap, BasinMap, LakeMap, Lake } from '../../World/heightmap';
 import { getHeightAt } from '../../World/heightmap';
 import type { SoilOverlay } from '../GameRenderer';
 
@@ -333,12 +333,11 @@ class ThreeRenderer implements GameRenderer {
     private dirtDetailTex: THREE.Texture | null = null;
     // Ocean plane (infinite water around island)
     private oceanMesh: THREE.Mesh | null = null;
-    // Water mesh for lakes
-    private waterMesh: THREE.Mesh | null = null;
-    private waterGeometry: THREE.PlaneGeometry | null = null;
-    private waterTexture: THREE.CanvasTexture | null = null;
-    private waterUpdateTimer = 0;
-    private static readonly WATER_UPDATE_INTERVAL = 500; // ms between water mesh updates
+    // Lake meshes (static, one per lake)
+    private lakeMeshes: THREE.Mesh[] = [];
+    private lakesBuilt = false;
+    private lakeWaterMat: THREE.ShaderMaterial | null = null;
+    private refractionRT: THREE.WebGLRenderTarget | null = null;
     // Grass LOD chunk system
     private grassChunks = new Map<string, { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number }>();
     private grassMat: THREE.MeshLambertMaterial | null = null;
@@ -352,6 +351,8 @@ class ThreeRenderer implements GameRenderer {
     private static readonly GRASS_STEP_NEAR = 0.5;
     private static readonly GRASS_STEP_FAR = 2.5;
     private static readonly GRASS_SCALE_FAR = 1.6;
+    private static readonly DEBUG_HIDE_GRASS = false;
+    private static readonly DEBUG_WIREFRAME = false;
     // Sun light
     private sunLight: THREE.DirectionalLight | null = null;
     // Weather effects
@@ -388,10 +389,13 @@ class ThreeRenderer implements GameRenderer {
     private static readonly PLAYER_SPEED = 0.5;
     private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
     private static readonly PLAYER_CROUCH_MULT = 0.35;
+    private static readonly PLAYER_SWIM_MULT = 0.4;
+    private static readonly SWIM_EYE_OFFSET = -0.06;
     private static readonly MOUSE_SENSITIVITY = 0.001;
     private static readonly FP_EYE_HEIGHT = 0.216;
     private static readonly FP_CROUCH_HEIGHT = 0.13;
     private crouching = false;
+    private swimming = false;
     private currentEyeHeight = 0.216;
     // Stamina
     private static readonly STAMINA_MAX = 100;
@@ -621,7 +625,7 @@ class ThreeRenderer implements GameRenderer {
         }
 
         // --- Stream grass chunks around camera ---
-        if (this.groundHeightApplied && scene.soilGrid && scene.heightMap) {
+        if (!ThreeRenderer.DEBUG_HIDE_GRASS && this.groundHeightApplied && scene.soilGrid && scene.heightMap) {
             this.updateGrassChunks(scene);
         }
 
@@ -658,13 +662,34 @@ class ThreeRenderer implements GameRenderer {
         this.syncStockLabels(scene);
         this.syncHighlight(highlight);
 
-        // --- Update water mesh (lakes) ---
-        this.updateWaterMesh(scene);
+        // --- Build static lake meshes (once) ---
+        this.buildLakes(scene);
+        this.updateLakeUniforms();
 
-        // --- Third-person player ---
-        this.updatePlayer(scene, elapsed);
+        // --- First-person player ---
+        this.updatePlayer(scene, frameDt);
 
-        // --- Render ---
+        // --- Render (two-pass for water refraction) ---
+        if (this.lakeMeshes.length > 0) {
+            if (!this.refractionRT || this.refractionRT.width !== this.renderer.domElement.width || this.refractionRT.height !== this.renderer.domElement.height) {
+                if (this.refractionRT) this.refractionRT.dispose();
+                this.refractionRT = new THREE.WebGLRenderTarget(
+                    this.renderer.domElement.width,
+                    this.renderer.domElement.height,
+                    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter },
+                );
+            }
+            for (const lm of this.lakeMeshes) lm.visible = false;
+            this.renderer.setRenderTarget(this.refractionRT);
+            this.renderer.render(this.threeScene, this.threeCamera);
+            this.renderer.setRenderTarget(null);
+            for (const lm of this.lakeMeshes) lm.visible = true;
+
+            if (this.lakeWaterMat) {
+                this.lakeWaterMat.uniforms.uRefraction.value = this.refractionRT.texture;
+                this.lakeWaterMat.uniforms.uScreenSize.value.set(this.renderer.domElement.width, this.renderer.domElement.height);
+            }
+        }
         this.renderer.render(this.threeScene, this.threeCamera);
 
         // --- Interaction HUD (drawn AFTER 3D render) ---
@@ -732,12 +757,12 @@ class ThreeRenderer implements GameRenderer {
         return { leftX: 0, leftY: 0, rightX: 0, rightY: 0, sprint: false };
     }
 
-    private updatePlayer(_scene: Scene, _elapsed: number) {
+    private updatePlayer(_scene: Scene, frameDt: number) {
         if (!this.threeCamera) return;
 
         if (this.playerMesh) this.playerMesh.visible = false;
 
-        const dt = this.clock.getDelta() || 1 / 60;
+        const dt = frameDt > 0 ? frameDt : 1 / 60;
         const gp = this.pollGamepad();
         const wantsSprint = !this.crouching && (this.keysDown.has('shift') || gp.sprint);
 
@@ -759,12 +784,20 @@ class ThreeRenderer implements GameRenderer {
             }
         }
 
+        const lake = _scene.lakeMap ? getLakeAt(_scene.lakeMap, this.playerPos.x, this.playerPos.y) : null;
+        const terrainAtPlayer = _activeHeightMap ? getHeightAt(_activeHeightMap, this.playerPos.x, this.playerPos.y) : 0;
+        this.swimming = lake !== null && terrainAtPlayer < lake.waterElevation;
+
         let speedMult = 1;
-        if (sprinting) speedMult = ThreeRenderer.PLAYER_SPRINT_MULT;
+        if (this.swimming) speedMult = ThreeRenderer.PLAYER_SWIM_MULT;
+        else if (sprinting) speedMult = ThreeRenderer.PLAYER_SPRINT_MULT;
         else if (this.crouching) speedMult = ThreeRenderer.PLAYER_CROUCH_MULT;
         const speed = ThreeRenderer.PLAYER_SPEED * speedMult;
 
-        const targetEye = this.crouching ? ThreeRenderer.FP_CROUCH_HEIGHT : ThreeRenderer.FP_EYE_HEIGHT;
+        let targetEye: number;
+        if (this.swimming) targetEye = ThreeRenderer.FP_EYE_HEIGHT;
+        else if (this.crouching) targetEye = ThreeRenderer.FP_CROUCH_HEIGHT;
+        else targetEye = ThreeRenderer.FP_EYE_HEIGHT;
         this.currentEyeHeight += (targetEye - this.currentEyeHeight) * Math.min(1, 12 * dt);
 
         const sinYaw = Math.sin(this.cameraYaw);
@@ -806,8 +839,13 @@ class ThreeRenderer implements GameRenderer {
         _scene.playerCrouching = this.crouching;
 
         const pivotW = toWorld(this.playerPos);
+        let groundY = pivotW.y;
+        if (this.swimming && lake) {
+            const waterY = lake.waterElevation * HEIGHT_SCALE;
+            groundY = waterY + ThreeRenderer.SWIM_EYE_OFFSET;
+        }
         const eyeX = pivotW.x;
-        const eyeY = pivotW.y + this.currentEyeHeight;
+        const eyeY = groundY + this.currentEyeHeight;
         const eyeZ = pivotW.z;
 
         this.threeCamera.position.set(eyeX, eyeY, eyeZ);
@@ -1241,11 +1279,14 @@ class ThreeRenderer implements GameRenderer {
         if (this.oceanMesh) this.disposeObject(this.oceanMesh);
         this.oceanMesh = null;
 
-        if (this.waterMesh) this.disposeObject(this.waterMesh);
-        this.waterMesh = null;
-        this.waterGeometry = null;
-        if (this.waterTexture) this.waterTexture.dispose();
-        this.waterTexture = null;
+        for (const lm of this.lakeMeshes) {
+            this.threeScene?.remove(lm);
+            this.disposeObject(lm);
+        }
+        this.lakeMeshes = [];
+        this.lakesBuilt = false;
+        if (this.lakeWaterMat) { this.lakeWaterMat.dispose(); this.lakeWaterMat = null; }
+        if (this.refractionRT) { this.refractionRT.dispose(); this.refractionRT = null; }
 
         this.controls?.dispose();
         this.renderer?.dispose();
@@ -1369,6 +1410,7 @@ class ThreeRenderer implements GameRenderer {
         soilGrid: SoilGrid, heightMap: HeightMap,
         lod: number,
         basinMap?: BasinMap | null,
+        lakeMap?: LakeMap | null,
     ): { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number } | null {
         const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
         const STEP = lod === 0 ? ThreeRenderer.GRASS_STEP_NEAR : ThreeRenderer.GRASS_STEP_FAR;
@@ -1418,6 +1460,11 @@ class ThreeRenderer implements GameRenderer {
                 const wz = worldZ0 + lz + (rand() - 0.5) * STEP * 1.8;
 
                 if (wx < -WORLD_HALF || wx > WORLD_HALF || wz < -WORLD_HALF || wz > WORLD_HALF) continue;
+
+                if (lakeMap) {
+                    const wd = getWaterDepthAt(lakeMap, heightMap, wx, wz, 0.5);
+                    if (wd > 0) continue;
+                }
 
                 const hum = sampleBilinear(soilGrid.layers.humidity, wx, wz);
                 const waterLvl = sampleBilinear(soilGrid.waterLevel, wx, wz);
@@ -1560,7 +1607,7 @@ class ThreeRenderer implements GameRenderer {
                 this.grassChunks.delete(key);
             }
             const [cx, cz] = key.split(',').map(Number);
-            const chunk = this.buildGrassChunk(cx, cz, soilGrid, heightMap, desiredLod, scene.basinMap);
+            const chunk = this.buildGrassChunk(cx, cz, soilGrid, heightMap, desiredLod, scene.basinMap, scene.lakeMap);
             if (chunk) {
                 this.threeScene!.add(chunk.instA);
                 this.threeScene!.add(chunk.instB);
@@ -2778,6 +2825,15 @@ class ThreeRenderer implements GameRenderer {
         this.ground.geometry.dispose();
         this.ground.geometry = geo;
         this.ground.position.set(centerX, 0, centerZ);
+
+        if (ThreeRenderer.DEBUG_WIREFRAME && this.threeScene) {
+            const wireMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+            const wireMesh = new THREE.Mesh(geo, wireMat);
+            wireMesh.rotation.x = -Math.PI / 2;
+            wireMesh.position.copy(this.ground.position);
+            wireMesh.position.y += 0.02;
+            this.threeScene.add(wireMesh);
+        }
     }
 
     // =============================================================
@@ -2870,24 +2926,34 @@ class ThreeRenderer implements GameRenderer {
         const ctx = this.splatCanvas.getContext('2d')!;
         const imageData = ctx.createImageData(cols, rows);
 
-        for (let i = 0; i < cols * rows; i++) {
-            const humidity = sg.layers.humidity[i];
-            const elev = (hm.data[i] - hm.minHeight) / range;
-            const rockFactor = Math.min(1, Math.max(0, elev - 0.45) * 2.5);
-            const grassFactor = humidity * (1 - rockFactor);
-            let blend = Math.max(0, Math.min(1, grassFactor * 2.2));
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const i = row * cols + col;
+                const wx = sg.originX + col * sg.cellSize + sg.cellSize * 0.5;
+                const wy = sg.originY + row * sg.cellSize + sg.cellSize * 0.5;
 
-            const st = sg.soilType[i];
-            if (st === 1) blend *= 0.15;
-            else if (st === 3) blend *= 0.05;
-            else if (st === 4) blend = Math.min(1, blend * 1.3);
+                const hmCol = Math.min(hm.cols - 1, Math.max(0, Math.round((wx - hm.originX) / hm.cellSize)));
+                const hmRow = Math.min(hm.rows - 1, Math.max(0, Math.round((wy - hm.originY) / hm.cellSize)));
+                const hmIdx = hmRow * hm.cols + hmCol;
 
-            const basin = bm ? bm.data[i] : 0;
-            const px = i * 4;
-            imageData.data[px + 0] = Math.round(blend * 255);
-            imageData.data[px + 1] = Math.round(basin * 255);
-            imageData.data[px + 2] = st;
-            imageData.data[px + 3] = 255;
+                const humidity = sg.layers.humidity[i];
+                const elev = (hm.data[hmIdx] - hm.minHeight) / range;
+                const rockFactor = Math.min(1, Math.max(0, elev - 0.45) * 2.5);
+                const grassFactor = humidity * (1 - rockFactor);
+                let blend = Math.max(0, Math.min(1, grassFactor * 2.2));
+
+                const st = sg.soilType[i];
+                if (st === 1) blend *= 0.15;
+                else if (st === 3) blend *= 0.05;
+                else if (st === 4) blend = Math.min(1, blend * 1.3);
+
+                const basin = bm ? bm.data[hmIdx] : 0;
+                const px = i * 4;
+                imageData.data[px + 0] = Math.round(blend * 255);
+                imageData.data[px + 1] = Math.round(basin * 255);
+                imageData.data[px + 2] = st;
+                imageData.data[px + 3] = 255;
+            }
         }
         ctx.putImageData(imageData, 0, 0);
 
@@ -2923,9 +2989,14 @@ class ThreeRenderer implements GameRenderer {
         const hm = scene.heightMap;
         const sg = scene.soilGrid;
         const bm = scene.basinMap;
-        const cols = hm?.cols ?? sg?.cols ?? 0;
-        const rows = hm?.rows ?? sg?.rows ?? 0;
+        const useHmGrid = overlay === 'elevation' || overlay === 'basin';
+        const cols = useHmGrid ? (hm?.cols ?? 0) : (sg?.cols ?? hm?.cols ?? 0);
+        const rows = useHmGrid ? (hm?.rows ?? 0) : (sg?.rows ?? hm?.rows ?? 0);
         if (cols === 0 || rows === 0) return;
+
+        const gridOriginX = useHmGrid ? (hm?.originX ?? 0) : (sg?.originX ?? hm?.originX ?? 0);
+        const gridOriginY = useHmGrid ? (hm?.originY ?? 0) : (sg?.originY ?? hm?.originY ?? 0);
+        const gridCellSize = useHmGrid ? (hm?.cellSize ?? 1) : (sg?.cellSize ?? hm?.cellSize ?? 1);
 
         let canvas: HTMLCanvasElement;
         if (this.groundTexture) {
@@ -2943,101 +3014,112 @@ class ThreeRenderer implements GameRenderer {
         const ctx = canvas.getContext('2d')!;
         const imageData = ctx.createImageData(cols, rows);
 
-        for (let i = 0; i < cols * rows; i++) {
-            const px = i * 4;
-            let r: number, g: number, b: number;
+        const sampleHm = (wx: number, wy: number): number => {
+            if (!hm) return 0;
+            const hc = Math.min(hm.cols - 1, Math.max(0, Math.round((wx - hm.originX) / hm.cellSize)));
+            const hr = Math.min(hm.rows - 1, Math.max(0, Math.round((wy - hm.originY) / hm.cellSize)));
+            return hm.data[hr * hm.cols + hc];
+        };
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const i = row * cols + col;
+                const wx = gridOriginX + col * gridCellSize + gridCellSize * 0.5;
+                const wy = gridOriginY + row * gridCellSize + gridCellSize * 0.5;
+                const px = i * 4;
+                let r: number, g: number, b: number;
 
-            if (overlay === 'elevation' && hm) {
-                const range = hm.maxHeight - hm.minHeight || 1;
-                const h = (hm.data[i] - hm.minHeight) / range;
-                r = Math.round(40 + h * 200);
-                g = Math.round(80 + h * 140);
-                b = Math.round(40 + h * 80);
-            } else if (overlay === 'basin' && bm) {
-                const v = bm.data[i];
-                r = Math.round(200 - v * 190);
-                g = Math.round(184 - v * 126);
-                b = Math.round(122 + v * 0);
-            } else if (overlay === 'water' && sg) {
-                const wl = sg.waterLevel[i];
-                const depth = Math.min(1, wl);
-                r = Math.round(200 * (1 - depth) + 10 * depth);
-                g = Math.round(184 * (1 - depth) + 74 * depth);
-                b = Math.round(122 * (1 - depth) + 160 * depth);
-            } else if (overlay === 'soilType' && sg) {
-                const stId = SOIL_TYPE_INDEX[sg.soilType[i]];
-                const c = SOIL_TYPE_DEFS[stId].color;
-                r = (c >> 16) & 0xff;
-                g = (c >> 8) & 0xff;
-                b = c & 0xff;
-            } else if (overlay && overlay !== 'elevation' && overlay !== 'basin' && overlay !== 'water' && overlay !== 'soilType' && sg) {
-                const v = sg.layers[overlay as SoilProperty][i];
-                const c = SOIL_OVERLAY_COLORS[overlay as SoilProperty];
-                r = Math.round(c.r0 + v * (c.r1 - c.r0));
-                g = Math.round(c.g0 + v * (c.g1 - c.g0));
-                b = Math.round(c.b0 + v * (c.b1 - c.b0));
-            } else {
-                // Default: realistic terrain color from soil + elevation
-                // Blends humidity, minerals, and normalized elevation:
-                //   Dry + high elevation → grey rock
-                //   Humid + low elevation → lush green
-                //   Mineral-rich → brownish earth
-                //   Moderate → golden/tan grass
-                if (sg && hm) {
-                    const humidity = sg.layers.humidity[i];
-                    const minerals = sg.layers.minerals[i];
+                if (overlay === 'elevation' && hm) {
                     const range = hm.maxHeight - hm.minHeight || 1;
-                    const elev = (hm.data[i] - hm.minHeight) / range; // [0..1]
-
-                    // Rocky mountain factor: high elevation + low humidity → grey rock
-                    const rockFactor = Math.max(0, elev - 0.45) * 2; // starts at elev 0.45
-                    // Lush green factor: high humidity
-                    const greenFactor = humidity;
-                    // Earth factor: minerals
-                    const earthFactor = minerals * 0.6;
-
-                    // Base dry color (warm tan)
-                    let br = 140, bg = 130, bb = 85;
-
-                    // Aggressive blend towards very dark olive — matches grass texture shadow
-                    // Uses squared humidity for faster transition into dark
-                    const gf = greenFactor * greenFactor; // 0.5 hum → 0.25, 0.7 → 0.49, 1.0 → 1.0
-                    const darkGf = Math.min(1, greenFactor * 1.8); // saturates earlier
-                    const blendF = Math.max(gf, darkGf * 0.7); // fast ramp
-                    // Target: ~#1E2515 (30, 37, 21) — near-black olive
-                    br += Math.round((-110 * 0.7) * blendF);   // 140 → 30
-                    bg += Math.round((-93 * 0.7) * blendF);    // 130 → 37
-                    bb += Math.round((-64 * 0.7) * blendF);    // 85 → 21
-
-                    // Blend towards brown earth (minerals)
-                    br += Math.round(15 * earthFactor);
-                    bg += Math.round((-20) * earthFactor);
-                    bb += Math.round((-15) * earthFactor);
-
-                    // Blend towards grey rock (high elevation)
-                    const rockR = 140, rockG = 135, rockB = 130;
-                    const rf = Math.min(1, rockFactor);
-                    br = Math.round(br * (1 - rf) + rockR * rf);
-                    bg = Math.round(bg * (1 - rf) + rockG * rf);
-                    bb = Math.round(bb * (1 - rf) + rockB * rf);
-
-                    r = Math.max(0, Math.min(255, br));
-                    g = Math.max(0, Math.min(255, bg));
-                    b = Math.max(0, Math.min(255, bb));
-                } else if (sg) {
-                    const h = sg.layers.humidity[i];
-                    r = Math.round(200 - h * 174);
-                    g = Math.round(184 - h * 62);
-                    b = Math.round(122 - h * 80);
+                    const h = (hm.data[i] - hm.minHeight) / range;
+                    r = Math.round(40 + h * 200);
+                    g = Math.round(80 + h * 140);
+                    b = Math.round(40 + h * 80);
+                } else if (overlay === 'basin' && bm) {
+                    const v = bm.data[i];
+                    r = Math.round(200 - v * 190);
+                    g = Math.round(184 - v * 126);
+                    b = Math.round(122 + v * 0);
+                } else if (overlay === 'water' && sg) {
+                    const wl = sg.waterLevel[i];
+                    const depth = Math.min(1, wl);
+                    r = Math.round(200 * (1 - depth) + 10 * depth);
+                    g = Math.round(184 * (1 - depth) + 74 * depth);
+                    b = Math.round(122 * (1 - depth) + 160 * depth);
+                } else if (overlay === 'soilType' && sg) {
+                    const stId = SOIL_TYPE_INDEX[sg.soilType[i]];
+                    const c = SOIL_TYPE_DEFS[stId].color;
+                    r = (c >> 16) & 0xff;
+                    g = (c >> 8) & 0xff;
+                    b = c & 0xff;
+                } else if (overlay && overlay !== 'elevation' && overlay !== 'basin' && overlay !== 'water' && overlay !== 'soilType' && sg) {
+                    const v = sg.layers[overlay as SoilProperty][i];
+                    const c = SOIL_OVERLAY_COLORS[overlay as SoilProperty];
+                    r = Math.round(c.r0 + v * (c.r1 - c.r0));
+                    g = Math.round(c.g0 + v * (c.g1 - c.g0));
+                    b = Math.round(c.b0 + v * (c.b1 - c.b0));
                 } else {
-                    r = 58; g = 125; b = 68;
-                }
-            }
+                    if (sg && hm) {
+                        const sgCol = Math.min(sg.cols - 1, Math.max(0, Math.round((wx - sg.originX) / sg.cellSize)));
+                        const sgRow = Math.min(sg.rows - 1, Math.max(0, Math.round((wy - sg.originY) / sg.cellSize)));
+                        const si = sgRow * sg.cols + sgCol;
+                        const humidity = sg.layers.humidity[si];
+                        const minerals = sg.layers.minerals[si];
+                        const range = hm.maxHeight - hm.minHeight || 1;
+                        const elev = (sampleHm(wx, wy) - hm.minHeight) / range;
 
-            imageData.data[px + 0] = r;
-            imageData.data[px + 1] = g;
-            imageData.data[px + 2] = b;
-            imageData.data[px + 3] = 255;
+                        // Rocky mountain factor: high elevation + low humidity → grey rock
+                        const rockFactor = Math.max(0, elev - 0.45) * 2; // starts at elev 0.45
+                        // Lush green factor: high humidity
+                        const greenFactor = humidity;
+                        // Earth factor: minerals
+                        const earthFactor = minerals * 0.6;
+
+                        // Base dry color (warm tan)
+                        let br = 140, bg = 130, bb = 85;
+
+                        // Aggressive blend towards very dark olive — matches grass texture shadow
+                        // Uses squared humidity for faster transition into dark
+                        const gf = greenFactor * greenFactor; // 0.5 hum → 0.25, 0.7 → 0.49, 1.0 → 1.0
+                        const darkGf = Math.min(1, greenFactor * 1.8); // saturates earlier
+                        const blendF = Math.max(gf, darkGf * 0.7); // fast ramp
+                        // Target: ~#1E2515 (30, 37, 21) — near-black olive
+                        br += Math.round((-110 * 0.7) * blendF);   // 140 → 30
+                        bg += Math.round((-93 * 0.7) * blendF);    // 130 → 37
+                        bb += Math.round((-64 * 0.7) * blendF);    // 85 → 21
+
+                        // Blend towards brown earth (minerals)
+                        br += Math.round(15 * earthFactor);
+                        bg += Math.round((-20) * earthFactor);
+                        bb += Math.round((-15) * earthFactor);
+
+                        // Blend towards grey rock (high elevation)
+                        const rockR = 140, rockG = 135, rockB = 130;
+                        const rf = Math.min(1, rockFactor);
+                        br = Math.round(br * (1 - rf) + rockR * rf);
+                        bg = Math.round(bg * (1 - rf) + rockG * rf);
+                        bb = Math.round(bb * (1 - rf) + rockB * rf);
+
+                        r = Math.max(0, Math.min(255, br));
+                        g = Math.max(0, Math.min(255, bg));
+                        b = Math.max(0, Math.min(255, bb));
+                    } else if (sg) {
+                        const sgCol2 = Math.min(sg.cols - 1, Math.max(0, Math.round((wx - sg.originX) / sg.cellSize)));
+                        const sgRow2 = Math.min(sg.rows - 1, Math.max(0, Math.round((wy - sg.originY) / sg.cellSize)));
+                        const si2 = sgRow2 * sg.cols + sgCol2;
+                        const h = sg.layers.humidity[si2];
+                        r = Math.round(200 - h * 174);
+                        g = Math.round(184 - h * 62);
+                        b = Math.round(122 - h * 80);
+                    } else {
+                        r = 58; g = 125; b = 68;
+                    }
+                }
+
+                imageData.data[px + 0] = r;
+                imageData.data[px + 1] = g;
+                imageData.data[px + 2] = b;
+                imageData.data[px + 3] = 255;
+            }
         }
 
         ctx.putImageData(imageData, 0, 0);
@@ -3059,7 +3141,7 @@ class ThreeRenderer implements GameRenderer {
 
         // If no heightmap applied yet, also resize geometry to match grid
         if (!this.groundHeightApplied && (sg || hm)) {
-            const ref = sg ?? hm!;
+            const ref = hm ?? sg!;
             const worldW = (ref.cols - 1) * ref.cellSize * SCALE;
             const worldH = (ref.rows - 1) * ref.cellSize * SCALE;
             const centerX = (ref.originX + (ref.cols - 1) * ref.cellSize / 2) * SCALE;
@@ -3070,135 +3152,191 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    // --- Water mesh (lakes) ---
+    // --- Lake meshes (static water bodies) ---
 
-    private updateWaterMesh(scene: Scene) {
-        if (!this.threeScene) return;
+    private buildLakes(scene: Scene) {
+        if (!this.threeScene || !scene.lakeMap || !scene.heightMap) return;
+        if (this.lakesBuilt) return;
+        this.lakesBuilt = true;
 
-        // If lakes disabled or no soil grid, remove water mesh if present
-        if (!scene.lakesEnabled || !scene.soilGrid || !scene.heightMap) {
-            if (this.waterMesh) {
-                this.threeScene.remove(this.waterMesh);
-                this.disposeObject(this.waterMesh);
-                this.waterMesh = null;
-                this.waterGeometry = null;
-                if (this.waterTexture) this.waterTexture.dispose();
-                this.waterTexture = null;
-            }
-            return;
-        }
-
-        // Throttle updates (no need to recalc every frame)
-        this.waterUpdateTimer += this.clock.getDelta() * 1000;
-        if (this.waterMesh && this.waterUpdateTimer < ThreeRenderer.WATER_UPDATE_INTERVAL) return;
-        this.waterUpdateTimer = 0;
-
-        const sg = scene.soilGrid;
         const hm = scene.heightMap;
-        const { cols, rows, cellSize, originX, originY, waterLevel } = sg;
+        const lm = scene.lakeMap;
 
-        // Check if any water exists at all
-        let hasWater = false;
-        for (let i = 0; i < cols * rows; i++) {
-            if (waterLevel[i] > 0.01) { hasWater = true; break; }
-        }
+        if (!this.lakeWaterMat) {
+            const loader = new THREE.TextureLoader();
+            const waterTex = loader.load('/textures/ground/water.png');
+            waterTex.wrapS = waterTex.wrapT = THREE.RepeatWrapping;
+            waterTex.minFilter = THREE.LinearMipmapLinearFilter;
+            waterTex.magFilter = THREE.LinearFilter;
 
-        if (!hasWater) {
-            if (this.waterMesh) {
-                this.waterMesh.visible = false;
-            }
-            return;
-        }
-
-        // Create or reuse geometry — match ground grid: (cols-1) segments = cols vertices
-        if (!this.waterGeometry) {
-            this.waterGeometry = new THREE.PlaneGeometry(
-                (cols - 1) * cellSize * SCALE,
-                (rows - 1) * cellSize * SCALE,
-                cols - 1, rows - 1,
-            );
-            this.waterGeometry.rotateX(-Math.PI / 2);
-        }
-
-        // Update vertex heights: where there's water, raise to terrain + small offset
-        // Where there's no water, drop below terrain to hide
-        const posAttr = this.waterGeometry.getAttribute('position');
-        const WATER_OFFSET = 0.15; // small offset above terrain
-
-        for (let iy = 0; iy < rows; iy++) {
-            for (let ix = 0; ix < cols; ix++) {
-                const vIdx = iy * cols + ix;
-
-                // World position of this vertex (matches heightmap cell position)
-                const wx = originX + ix * cellSize;
-                const wy = originY + iy * cellSize;
-
-                const cellIdx = iy * cols + ix;
-                const wl = waterLevel[cellIdx];
-
-                const terrainH = getHeightAt(hm, wx, wy) * HEIGHT_SCALE;
-
-                if (wl > 0.01) {
-                    posAttr.setY(vIdx, terrainH + WATER_OFFSET);
-                } else {
-                    // Hide this vertex below terrain
-                    posAttr.setY(vIdx, terrainH - 2);
-                }
-            }
-        }
-        posAttr.needsUpdate = true;
-        this.waterGeometry.computeVertexNormals();
-
-        // Update alpha texture (per-cell alpha)
-        let waterCanvas: HTMLCanvasElement;
-        if (this.waterTexture) {
-            waterCanvas = this.waterTexture.image as HTMLCanvasElement;
-        } else {
-            waterCanvas = document.createElement('canvas');
-            waterCanvas.width = cols;
-            waterCanvas.height = rows;
-        }
-
-        const ctx = waterCanvas.getContext('2d')!;
-        const imageData = ctx.createImageData(cols, rows);
-
-        for (let i = 0; i < cols * rows; i++) {
-            const wl = waterLevel[i];
-            const px = i * 4;
-            const depth = Math.min(1, wl);
-            // Water color: shallow = light blue, deep = darker blue
-            imageData.data[px + 0] = Math.round(20 * (1 - depth) + 10 * depth);
-            imageData.data[px + 1] = Math.round(140 * (1 - depth) + 60 * depth);
-            imageData.data[px + 2] = Math.round(220 * (1 - depth) + 180 * depth);
-            imageData.data[px + 3] = wl > 0.01 ? Math.round(Math.min(200, wl * 220)) : 0;
-        }
-
-        ctx.putImageData(imageData, 0, 0);
-
-        if (this.waterTexture) {
-            this.waterTexture.needsUpdate = true;
-        } else {
-            this.waterTexture = new THREE.CanvasTexture(waterCanvas);
-            this.waterTexture.minFilter = THREE.LinearFilter;
-            this.waterTexture.magFilter = THREE.LinearFilter;
-        }
-
-        // Create mesh if needed
-        if (!this.waterMesh) {
-            const waterMat = new THREE.MeshLambertMaterial({
-                map: this.waterTexture,
+            this.lakeWaterMat = new THREE.ShaderMaterial({
                 transparent: true,
                 depthWrite: false,
                 side: THREE.DoubleSide,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uWaterTex: { value: waterTex },
+                    uRefraction: { value: null as THREE.Texture | null },
+                    uScreenSize: { value: new THREE.Vector2(1, 1) },
+                    uShallow: { value: new THREE.Color(0x4aadcf) },
+                    uDeep: { value: new THREE.Color(0x1a5a80) },
+                    uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.3).normalize() },
+                },
+                vertexShader: `
+                    uniform float uTime;
+                    varying vec3 vWorldPos;
+                    varying vec3 vNormal;
+                    varying vec2 vUv;
+                    varying vec4 vScreenPos;
+
+                    vec3 gerstnerWave(vec2 pos, vec2 dir, float steepness, float wl, float spd) {
+                        float k = 6.28318 / wl;
+                        float f = k * (dot(dir, pos) - spd / k * uTime);
+                        float a = steepness / k;
+                        return vec3(dir.x * a * cos(f), a * sin(f), dir.y * a * cos(f));
+                    }
+
+                    void main() {
+                        vUv = uv;
+                        vec4 wp = modelMatrix * vec4(position, 1.0);
+                        vec2 p = wp.xz;
+
+                        vec2 d1 = normalize(vec2(1.0, 0.3));
+                        vec2 d2 = normalize(vec2(-0.4, 1.0));
+                        vec2 d3 = normalize(vec2(0.7, -0.6));
+                        vec2 d4 = normalize(vec2(-0.8, -0.3));
+
+                        vec3 wave = gerstnerWave(p, d1, 0.12, 4.0, 1.2)
+                                  + gerstnerWave(p, d2, 0.08, 2.5, 0.9)
+                                  + gerstnerWave(p, d3, 0.05, 1.5, 1.5)
+                                  + gerstnerWave(p, d4, 0.03, 0.8, 2.0);
+
+                        wp.x += wave.x * 0.015;
+                        wp.y += wave.y * 0.015;
+                        wp.z += wave.z * 0.015;
+                        vWorldPos = wp.xyz;
+
+                        float eps = 0.05;
+                        float s = 0.015;
+                        vec3 wR = gerstnerWave(p + vec2(eps, 0.0), d1, 0.12, 4.0, 1.2)
+                                + gerstnerWave(p + vec2(eps, 0.0), d2, 0.08, 2.5, 0.9);
+                        vec3 wL = gerstnerWave(p - vec2(eps, 0.0), d1, 0.12, 4.0, 1.2)
+                                + gerstnerWave(p - vec2(eps, 0.0), d2, 0.08, 2.5, 0.9);
+                        vec3 wU = gerstnerWave(p + vec2(0.0, eps), d1, 0.12, 4.0, 1.2)
+                                + gerstnerWave(p + vec2(0.0, eps), d2, 0.08, 2.5, 0.9);
+                        vec3 wD = gerstnerWave(p - vec2(0.0, eps), d1, 0.12, 4.0, 1.2)
+                                + gerstnerWave(p - vec2(0.0, eps), d2, 0.08, 2.5, 0.9);
+                        vec3 T = normalize(vec3(2.0 * eps, (wR.y - wL.y) * s, 0.0));
+                        vec3 B = normalize(vec3(0.0, (wU.y - wD.y) * s, 2.0 * eps));
+                        vNormal = normalize(cross(B, T));
+
+                        gl_Position = projectionMatrix * viewMatrix * wp;
+                        vScreenPos = gl_Position;
+                    }
+                `,
+                fragmentShader: `
+                    uniform float uTime;
+                    uniform sampler2D uWaterTex;
+                    uniform sampler2D uRefraction;
+                    uniform vec2 uScreenSize;
+                    uniform vec3 uShallow;
+                    uniform vec3 uDeep;
+                    uniform vec3 uSunDir;
+                    varying vec3 vWorldPos;
+                    varying vec3 vNormal;
+                    varying vec2 vUv;
+                    varying vec4 vScreenPos;
+
+                    void main() {
+                        vec3 N = normalize(vNormal);
+                        vec3 viewDir = normalize(cameraPosition - vWorldPos);
+
+                        vec2 screenUV = (vScreenPos.xy / vScreenPos.w) * 0.5 + 0.5;
+
+                        float refrStrength = 0.07;
+                        vec2 refrOffset = N.xz * refrStrength;
+
+                        float caustic1 = sin(vWorldPos.x * 12.0 + uTime * 1.5) * sin(vWorldPos.z * 10.0 + uTime * 1.2);
+                        float caustic2 = sin(vWorldPos.x * 8.0 - uTime * 0.9) * sin(vWorldPos.z * 14.0 - uTime * 1.1);
+                        refrOffset += vec2(caustic1, caustic2) * 0.025;
+
+                        vec2 refrUV = clamp(screenUV + refrOffset, 0.001, 0.999);
+                        vec3 bottomCol = texture2D(uRefraction, refrUV).rgb;
+
+                        float texScale = 6.0;
+                        vec2 distort = N.xz * 0.02;
+                        vec2 uv1 = vWorldPos.xz * texScale + distort + vec2(uTime * 0.018, uTime * 0.012);
+                        vec2 uv2 = vWorldPos.xz * texScale * 0.6 + distort * 1.5 + vec2(-uTime * 0.012, uTime * 0.02);
+                        vec3 texCol = mix(texture2D(uWaterTex, uv1).rgb, texture2D(uWaterTex, uv2).rgb, 0.5);
+
+                        float edge = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
+                        float depthFactor = smoothstep(0.0, 0.3, edge);
+
+                        vec3 waterTint = mix(uShallow, uDeep, depthFactor);
+                        vec3 surfaceCol = mix(waterTint, texCol * waterTint, 0.4);
+
+                        float bottomMix = mix(0.75, 0.35, depthFactor);
+                        vec3 col = mix(surfaceCol, bottomCol, bottomMix);
+
+                        float fresnel = pow(1.0 - max(0.0, dot(viewDir, N)), 4.0);
+                        vec3 skyCol = vec3(0.55, 0.72, 0.9);
+                        col = mix(col, skyCol, fresnel * 0.35);
+
+                        vec3 H = normalize(uSunDir + viewDir);
+                        float spec = pow(max(0.0, dot(N, H)), 180.0);
+                        col += vec3(1.0, 0.95, 0.85) * spec * 0.7;
+
+                        float causticBright = max(0.0, caustic1 * 0.5 + 0.5) * max(0.0, caustic2 * 0.5 + 0.5);
+                        col += vec3(0.8, 0.9, 1.0) * causticBright * 0.08 * (1.0 - depthFactor);
+
+                        float foam = smoothstep(0.015, 0.0, edge) * 0.25;
+                        col += vec3(foam);
+
+                        float alpha = mix(0.35, 0.7, depthFactor);
+                        gl_FragColor = vec4(col, alpha);
+                    }
+                `,
             });
-            this.waterMesh = new THREE.Mesh(this.waterGeometry, waterMat);
-            const centerX = (originX + (cols - 1) * cellSize / 2) * SCALE;
-            const centerZ = (originY + (rows - 1) * cellSize / 2) * SCALE;
-            this.waterMesh.position.set(centerX, 0, centerZ);
-            this.threeScene.add(this.waterMesh);
         }
 
-        this.waterMesh.visible = true;
+        for (const lake of lm.lakes) {
+            const mesh = this.buildLakeMesh(lake, hm, lm);
+            if (mesh) {
+                this.threeScene.add(mesh);
+                this.lakeMeshes.push(mesh);
+            }
+        }
+    }
+
+    private buildLakeMesh(lake: Lake, _hm: HeightMap, lm: LakeMap): THREE.Mesh | null {
+        const { cellSize, originX, originY } = lm;
+        const waterY = lake.waterElevation * HEIGHT_SCALE;
+
+        const pad = 2;
+        const w = (lake.maxCol - lake.minCol + 1 + pad * 2) * cellSize * SCALE;
+        const h = (lake.maxRow - lake.minRow + 1 + pad * 2) * cellSize * SCALE;
+
+        const segTarget = 0.8;
+        const segsX = Math.max(2, Math.ceil(w / segTarget));
+        const segsZ = Math.max(2, Math.ceil(h / segTarget));
+
+        const geo = new THREE.PlaneGeometry(w, h, segsX, segsZ);
+        geo.rotateX(-Math.PI / 2);
+
+        const centerX = (originX + (lake.minCol + lake.maxCol) * 0.5 * cellSize) * SCALE;
+        const centerZ = (originY + (lake.minRow + lake.maxRow) * 0.5 * cellSize) * SCALE;
+
+        const mesh = new THREE.Mesh(geo, this.lakeWaterMat!);
+        mesh.position.set(centerX, waterY, centerZ);
+        mesh.renderOrder = 1;
+
+        return mesh;
+    }
+
+    private updateLakeUniforms() {
+        if (this.lakeWaterMat) {
+            this.lakeWaterMat.uniforms.uTime.value = performance.now() / 1000;
+        }
     }
 
     // --- Utility ---

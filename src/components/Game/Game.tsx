@@ -12,7 +12,8 @@ import { generateEntityId } from '../Shared/ids';
 import { /* initFactions, */ updateFactionStats, checkFactionConflicts } from '../World/factions';
 import { processEvents } from '../World/events';
 import { createSoilGrid } from '../World/fertility';
-import { createHeightMap, createBasinMap, createDepressionMap, getHeightAt, SEA_LEVEL } from '../World/heightmap';
+import { createHeightMap, createBasinMap, createDepressionMap, generateLakes, getHeightAt, getWaterDepthAt, SEA_LEVEL } from '../World/heightmap';
+import type { LakeMap } from '../World/heightmap';
 import { createWeatherState, WEATHER_LABELS, WEATHER_ICONS, WEATHER_TYPES } from '../World/weather';
 import type { WeatherType } from '../World/weather';
 import { GameRenderer, createRenderer, getAvailableRenderers, SoilOverlay } from '../Render/GameRenderer';
@@ -286,7 +287,7 @@ function generateResourceCluster(
     }
 }
 
-function generateTestPlants(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap) {
+function generateTestPlants(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap, lakeMap?: LakeMap) {
     const MARGIN = 100;
 
     // Species configs: id, count, preferred humidity range, growth range
@@ -321,6 +322,7 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
             const y = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
 
             if (getHeightAt(heightMap, x, y) < SEA_LEVEL + 3) continue;
+            if (lakeMap && getWaterDepthAt(lakeMap, heightMap, x, y, 5) > 0) continue;
 
             const col = Math.floor((x - soilGrid.originX) / soilGrid.cellSize);
             const row = Math.floor((y - soilGrid.originY) / soilGrid.cellSize);
@@ -355,7 +357,7 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
     }
 }
 
-function generateDenseForests(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap) {
+function generateDenseForests(entities: Scene['entities'], soilGrid: import('../World/fertility').SoilGrid, heightMap: import('../World/heightmap').HeightMap, lakeMap?: LakeMap) {
     const MARGIN = 150;
 
     const forestDefs: { species: string[]; count: number; radius: number; treesPerForest: number; humMin: number }[] = [
@@ -373,6 +375,7 @@ function generateDenseForests(entities: Scene['entities'], soilGrid: import('../
                 centerX = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
                 centerY = (Math.random() * 2 - 1) * (WORLD_HALF - MARGIN);
                 if (getHeightAt(heightMap, centerX, centerY) < SEA_LEVEL + 5) continue;
+                if (lakeMap && getWaterDepthAt(lakeMap, heightMap, centerX, centerY, 10) > 0) continue;
                 const col = Math.floor((centerX - soilGrid.originX) / soilGrid.cellSize);
                 const row = Math.floor((centerY - soilGrid.originY) / soilGrid.cellSize);
                 if (col < 0 || col >= soilGrid.cols || row < 0 || row >= soilGrid.rows) continue;
@@ -392,6 +395,7 @@ function generateDenseForests(entities: Scene['entities'], soilGrid: import('../
                 if (tx < -WORLD_HALF + 50 || tx > WORLD_HALF - 50) continue;
                 if (ty < -WORLD_HALF + 50 || ty > WORLD_HALF - 50) continue;
                 if (getHeightAt(heightMap, tx, ty) < SEA_LEVEL + 3) continue;
+                if (lakeMap && getWaterDepthAt(lakeMap, heightMap, tx, ty, 5) > 0) continue;
 
                 const speciesId = def.species[Math.floor(Math.random() * def.species.length)];
                 const growth = 0.7 + Math.random() * 0.3;
@@ -472,29 +476,31 @@ function createInitialScene(): Scene {
     //     generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
     // }
 
-    const CELL_SIZE = 12;
+    const HEIGHTMAP_CELL = 12;
+    const SOIL_CELL = 32;
     const heightMap = createHeightMap(
         -WORLD_HALF, -WORLD_HALF,
         WORLD_HALF * 2, WORLD_HALF * 2,
-        CELL_SIZE,
+        HEIGHTMAP_CELL,
         150,
         77,
     );
     const soilGrid = createSoilGrid(
         -WORLD_HALF, -WORLD_HALF,
         WORLD_HALF * 2, WORLD_HALF * 2,
-        CELL_SIZE,
+        SOIL_CELL,
         42,
         heightMap,
     );
     const basinMap = createBasinMap(heightMap);
     const depressionMap = createDepressionMap(heightMap);
+    const lakeMap = generateLakes(heightMap, depressionMap);
 
     // Scatter initial plants across the map
-    generateTestPlants(entities, soilGrid, heightMap);
+    generateTestPlants(entities, soilGrid, heightMap, lakeMap);
 
     // Dense forest clusters
-    generateDenseForests(entities, soilGrid, heightMap);
+    generateDenseForests(entities, soilGrid, heightMap, lakeMap);
 
     // Spawn raspberry bushes near player start (0,0) for testing
     for (let i = 0; i < 6; i++) {
@@ -520,7 +526,7 @@ function createInitialScene(): Scene {
     generateInitialAnimals(entities, heightMap);
 
     const weather = createWeatherState();
-    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true, signals: [] };
+    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, lakeMap, weather, lakesEnabled: true, signals: [] };
 
     // initFactions(scene, VILLAGE_CENTERS); // disabled while testing flora
 
