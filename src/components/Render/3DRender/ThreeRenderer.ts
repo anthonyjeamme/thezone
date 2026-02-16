@@ -387,8 +387,21 @@ class ThreeRenderer implements GameRenderer {
     private pointerLockHandler: (() => void) | null = null;
     private static readonly PLAYER_SPEED = 0.5;
     private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
+    private static readonly PLAYER_CROUCH_MULT = 0.35;
     private static readonly MOUSE_SENSITIVITY = 0.001;
     private static readonly FP_EYE_HEIGHT = 0.216;
+    private static readonly FP_CROUCH_HEIGHT = 0.13;
+    private crouching = false;
+    private currentEyeHeight = 0.216;
+    // Stamina
+    private static readonly STAMINA_MAX = 100;
+    private static readonly STAMINA_DRAIN = 20;
+    private static readonly STAMINA_REGEN = 12;
+    private static readonly STAMINA_REGEN_DELAY = 1.5;
+    private static readonly STAMINA_EXHAUST_THRESHOLD = 5;
+    private stamina = 100;
+    private staminaRegenCooldown = 0;
+    private staminaExhausted = false;
     // Smoothing half-lives (seconds) — lower = snappier
     private static readonly HL_CAM_POS = 0.01;
     private static readonly HL_CAM_Y = 0.01;
@@ -555,6 +568,7 @@ class ThreeRenderer implements GameRenderer {
         this.keyHandler = (e: KeyboardEvent) => {
             const k = e.key.toLowerCase();
             this.keysDown.add(k);
+            if (k === 'c') this.crouching = !this.crouching;
         };
         this.keyUpHandler = (e: KeyboardEvent) => this.keysDown.delete(e.key.toLowerCase());
         window.addEventListener('keydown', this.keyHandler);
@@ -725,8 +739,33 @@ class ThreeRenderer implements GameRenderer {
 
         const dt = this.clock.getDelta() || 1 / 60;
         const gp = this.pollGamepad();
-        const sprinting = this.keysDown.has('shift') || gp.sprint;
-        const speed = ThreeRenderer.PLAYER_SPEED * (sprinting ? ThreeRenderer.PLAYER_SPRINT_MULT : 1);
+        const wantsSprint = !this.crouching && (this.keysDown.has('shift') || gp.sprint);
+
+        if (this.staminaExhausted && this.stamina > ThreeRenderer.STAMINA_EXHAUST_THRESHOLD * 4) {
+            this.staminaExhausted = false;
+        }
+        const sprinting = wantsSprint && !this.staminaExhausted;
+
+        if (sprinting) {
+            this.stamina = Math.max(0, this.stamina - ThreeRenderer.STAMINA_DRAIN * dt);
+            this.staminaRegenCooldown = ThreeRenderer.STAMINA_REGEN_DELAY;
+            if (this.stamina <= ThreeRenderer.STAMINA_EXHAUST_THRESHOLD) {
+                this.staminaExhausted = true;
+            }
+        } else {
+            this.staminaRegenCooldown = Math.max(0, this.staminaRegenCooldown - dt);
+            if (this.staminaRegenCooldown <= 0) {
+                this.stamina = Math.min(ThreeRenderer.STAMINA_MAX, this.stamina + ThreeRenderer.STAMINA_REGEN * dt);
+            }
+        }
+
+        let speedMult = 1;
+        if (sprinting) speedMult = ThreeRenderer.PLAYER_SPRINT_MULT;
+        else if (this.crouching) speedMult = ThreeRenderer.PLAYER_CROUCH_MULT;
+        const speed = ThreeRenderer.PLAYER_SPEED * speedMult;
+
+        const targetEye = this.crouching ? ThreeRenderer.FP_CROUCH_HEIGHT : ThreeRenderer.FP_EYE_HEIGHT;
+        this.currentEyeHeight += (targetEye - this.currentEyeHeight) * Math.min(1, 12 * dt);
 
         const sinYaw = Math.sin(this.cameraYaw);
         const cosYaw = Math.cos(this.cameraYaw);
@@ -752,7 +791,8 @@ class ThreeRenderer implements GameRenderer {
         let moveX = fwdX * inputFwd + rightX * inputRight;
         let moveZ = fwdZ * inputFwd + rightZ * inputRight;
 
-        if (moveX !== 0 || moveZ !== 0) {
+        const isMoving = moveX !== 0 || moveZ !== 0;
+        if (isMoving) {
             const len = Math.sqrt(moveX * moveX + moveZ * moveZ);
             moveX /= len;
             moveZ /= len;
@@ -760,9 +800,14 @@ class ThreeRenderer implements GameRenderer {
             this.playerPos.y += (moveZ / SCALE) * speed * dt;
         }
 
+        _scene.playerPos = { x: this.playerPos.x, y: this.playerPos.y };
+        _scene.playerMoving = isMoving;
+        _scene.playerSprinting = sprinting && isMoving;
+        _scene.playerCrouching = this.crouching;
+
         const pivotW = toWorld(this.playerPos);
         const eyeX = pivotW.x;
-        const eyeY = pivotW.y + ThreeRenderer.FP_EYE_HEIGHT;
+        const eyeY = pivotW.y + this.currentEyeHeight;
         const eyeZ = pivotW.z;
 
         this.threeCamera.position.set(eyeX, eyeY, eyeZ);
@@ -992,6 +1037,33 @@ class ThreeRenderer implements GameRenderer {
             ctx.moveTo(cx, cy - gap - armLen); ctx.lineTo(cx, cy - gap);
             ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + gap + armLen);
             ctx.stroke();
+
+            const staminaPct = this.stamina / ThreeRenderer.STAMINA_MAX;
+            if (staminaPct < 0.8) {
+                const barW = 120 * dpr;
+                const barH = 6 * dpr;
+                const barX = cx - barW / 2;
+                const barY = canvas.height - 110 * dpr;
+                const radius2 = barH / 2;
+
+                ctx.globalAlpha = 0.6 + (1 - staminaPct) * 0.3;
+
+                ctx.beginPath();
+                ctx.roundRect(barX, barY, barW, barH, radius2);
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                ctx.fill();
+
+                const fillW = Math.max(0, barW * staminaPct);
+                if (fillW > 0) {
+                    ctx.beginPath();
+                    ctx.roundRect(barX, barY, fillW, barH, radius2);
+                    const lowStamina = staminaPct < 0.25;
+                    ctx.fillStyle = lowStamina ? '#ff4444' : '#ffcc00';
+                    ctx.fill();
+                }
+
+                ctx.globalAlpha = 1;
+            }
         }
 
         if (!this.interactTarget || !this.threeCamera) return;

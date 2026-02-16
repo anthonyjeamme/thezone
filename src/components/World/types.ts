@@ -513,6 +513,8 @@ export type AnimalEntity = {
     sex: 'male' | 'female';
     mateTargetId: string | null;
     state: 'idle' | 'wandering' | 'eating' | 'grazing' | 'fleeing' | 'sleeping' | 'calling' | 'mating' | 'dead';
+    pendingSignals: import('./signals').PendingSignal[];
+    alertLevel: number;
 };
 
 // --- Scene ---
@@ -528,6 +530,11 @@ export type Scene = {
     depressionMap?: import('./heightmap').DepressionMap; // topographic depressions for lake sim
     weather?: import('./weather').WeatherState;    // current weather conditions
     lakesEnabled: boolean;                          // toggle lakes feature on/off
+    signals?: import('./signals').Signal[];          // active world signals
+    playerPos?: Vector2D;                            // player world position (set by renderer)
+    playerMoving?: boolean;                          // is the player currently moving
+    playerSprinting?: boolean;                       // is the player sprinting
+    playerCrouching?: boolean;                       // is the player crouching
 };
 
 // --- World API ---

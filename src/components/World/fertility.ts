@@ -44,11 +44,11 @@ export type SoilTypeDef = {
 };
 
 export const SOIL_TYPE_DEFS: Record<SoilTypeId, SoilTypeDef> = {
-    dirt:  { id: 'dirt',  humidityMod: 1.0,  mineralsMod: 1.0,  organicMatterBase: 0.40, drainageRate: 0.50, fertilityMult: 1.0,  color: 0x8B7355 },
-    sand:  { id: 'sand',  humidityMod: 0.45, mineralsMod: 0.50, organicMatterBase: 0.10, drainageRate: 0.90, fertilityMult: 0.35, color: 0xC2B280 },
-    clay:  { id: 'clay',  humidityMod: 1.40, mineralsMod: 1.30, organicMatterBase: 0.35, drainageRate: 0.15, fertilityMult: 0.85, color: 0x9B7653 },
-    rock:  { id: 'rock',  humidityMod: 0.15, mineralsMod: 0.70, organicMatterBase: 0.02, drainageRate: 0.95, fertilityMult: 0.05, color: 0x808080 },
-    peat:  { id: 'peat',  humidityMod: 1.60, mineralsMod: 0.60, organicMatterBase: 0.80, drainageRate: 0.10, fertilityMult: 0.70, color: 0x3D2B1F },
+    dirt: { id: 'dirt', humidityMod: 1.0, mineralsMod: 1.0, organicMatterBase: 0.40, drainageRate: 0.50, fertilityMult: 1.0, color: 0x8B7355 },
+    sand: { id: 'sand', humidityMod: 0.45, mineralsMod: 0.50, organicMatterBase: 0.10, drainageRate: 0.90, fertilityMult: 0.35, color: 0xC2B280 },
+    clay: { id: 'clay', humidityMod: 1.40, mineralsMod: 1.30, organicMatterBase: 0.35, drainageRate: 0.15, fertilityMult: 0.85, color: 0x9B7653 },
+    rock: { id: 'rock', humidityMod: 0.15, mineralsMod: 0.70, organicMatterBase: 0.02, drainageRate: 0.95, fertilityMult: 0.05, color: 0x808080 },
+    peat: { id: 'peat', humidityMod: 1.60, mineralsMod: 0.60, organicMatterBase: 0.80, drainageRate: 0.10, fertilityMult: 0.70, color: 0x3D2B1F },
 };
 
 export const SOIL_TYPE_INDEX: SoilTypeId[] = [...SOIL_TYPE_IDS];
@@ -413,9 +413,9 @@ function diffuseSoil(grid: SoilGrid, dt: number) {
                 let flux = 0;
                 let neighbors = 0;
 
-                if (col > 0)        { flux += old[idx - 1] - old[idx]; neighbors++; }
+                if (col > 0) { flux += old[idx - 1] - old[idx]; neighbors++; }
                 if (col < cols - 1) { flux += old[idx + 1] - old[idx]; neighbors++; }
-                if (row > 0)        { flux += old[idx - cols] - old[idx]; neighbors++; }
+                if (row > 0) { flux += old[idx - cols] - old[idx]; neighbors++; }
                 if (row < rows - 1) { flux += old[idx + cols] - old[idx]; neighbors++; }
 
                 if (neighbors > 0) {

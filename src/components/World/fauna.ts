@@ -5,6 +5,7 @@ import {
 import { getHeightAt, SEA_LEVEL } from './heightmap';
 import type { SoilGrid } from './fertility';
 import { generateEntityId } from '../Shared/ids';
+import { type PerceptionProfile, type PendingSignal, emitSignal, processSignals, querySignals } from './signals';
 
 const DAYS = (d: number) => d * SECONDS_PER_DAY;
 
@@ -28,6 +29,7 @@ export type AnimalSpecies = {
     nocturnal: boolean;
     social: number;
     groupRadius: number;
+    perception: PerceptionProfile;
 };
 
 const speciesRegistry = new Map<AnimalSpeciesId, AnimalSpecies>();
@@ -60,6 +62,7 @@ registerAnimal({
     nocturnal: false,
     social: 0.2,
     groupRadius: 40,
+    perception: { hearing: 0.9, smell: 0.3, sight: 0.6, reactionTime: 0.4 },
 });
 
 registerAnimal({
@@ -82,6 +85,7 @@ registerAnimal({
     nocturnal: false,
     social: 0.8,
     groupRadius: 60,
+    perception: { hearing: 0.8, smell: 0.4, sight: 0.8, reactionTime: 0.8 },
 });
 
 registerAnimal({
@@ -104,6 +108,7 @@ registerAnimal({
     nocturnal: true,
     social: 0.1,
     groupRadius: 30,
+    perception: { hearing: 0.6, smell: 0.8, sight: 0.5, reactionTime: 0.5 },
 });
 
 registerAnimal({
@@ -126,6 +131,7 @@ registerAnimal({
     nocturnal: false,
     social: 0.7,
     groupRadius: 50,
+    perception: { hearing: 0.5, smell: 0.9, sight: 0.7, reactionTime: 0.6 },
 });
 
 function clampToWorld(x: number, y: number): { x: number; y: number } {
@@ -318,11 +324,115 @@ function spawnBaby(parent: AnimalEntity, species: AnimalSpecies): AnimalEntity {
         mateTargetId: null,
         sex: Math.random() < 0.5 ? 'male' : 'female',
         state: 'idle',
+        pendingSignals: [],
+        alertLevel: 0,
     };
+}
+
+const FLEE_SAFE_DIST = 60;
+const FLEE_CALM_TIME = SECONDS_PER_DAY * 0.15;
+
+function processAnimalSignals(scene: Scene, animal: AnimalEntity, species: AnimalSpecies, dt: number): boolean {
+    let strongestThreatPos: { x: number; y: number } | null = null;
+    let strongestIntensity = 0;
+
+    for (let i = animal.pendingSignals.length - 1; i >= 0; i--) {
+        const ps = animal.pendingSignals[i];
+        ps.reactionTimer -= dt;
+        if (ps.reactionTimer > 0) continue;
+
+        animal.pendingSignals.splice(i, 1);
+
+        const sig = ps.signal;
+
+        if (sig.data?.['source'] === 'player' || sig.data?.['threat'] === true) {
+            if (species.fleeFrom.length > 0 || species.diet === 'herbivore') {
+                if (ps.perceivedIntensity > strongestIntensity) {
+                    strongestIntensity = ps.perceivedIntensity;
+                    strongestThreatPos = sig.sourcePos;
+                }
+            }
+            if (species.diet === 'carnivore' || species.diet === 'omnivore') {
+                animal.alertLevel = Math.min(1, animal.alertLevel + ps.perceivedIntensity * 0.3);
+            }
+        }
+    }
+
+    if (strongestThreatPos) {
+        animal.alertLevel = Math.min(1, animal.alertLevel + strongestIntensity * 0.6);
+
+        const dx = animal.position.x - strongestThreatPos.x;
+        const dy = animal.position.y - strongestThreatPos.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 1;
+        const aheadDist = 20;
+        const fx = animal.position.x + (dx / d) * aheadDist;
+        const fy = animal.position.y + (dy / d) * aheadDist;
+        const clamped = clampToWorld(fx, fy);
+        animal.targetPos = clamped;
+        animal.mateTargetId = null;
+        animal.state = 'fleeing';
+        animal.speed = species.speed * (1.3 + strongestIntensity * 0.7);
+        animal.idleTimer = FLEE_CALM_TIME;
+        return true;
+    }
+
+    if (animal.state === 'fleeing') {
+        animal.idleTimer -= dt;
+        if (animal.idleTimer <= 0) {
+            animal.alertLevel = Math.max(0, animal.alertLevel - 0.2);
+            animal.state = 'idle';
+            animal.idleTimer = DAYS(0.3 + Math.random() * 0.5);
+            animal.speed = 0;
+            animal.targetPos = null;
+            return true;
+        }
+        if (animal.targetPos) {
+            const dx = animal.targetPos.x - animal.position.x;
+            const dy = animal.targetPos.y - animal.position.y;
+            if (dx * dx + dy * dy < 4) {
+                const angle = animal.heading + (Math.random() - 0.5) * 0.6;
+                const ext = 15;
+                animal.targetPos = clampToWorld(
+                    animal.position.x + Math.cos(angle) * ext,
+                    animal.position.y + Math.sin(angle) * ext,
+                );
+            }
+        }
+        return false;
+    }
+
+    animal.alertLevel = Math.max(0, animal.alertLevel - 0.5 * (dt / SECONDS_PER_DAY));
+    return false;
 }
 
 export function processFauna(scene: Scene, dt: number) {
     if (dt <= 0) return;
+
+    processSignals(scene, dt);
+
+    if (scene.playerPos) {
+        const recentNoise = (scene.signals ?? []).some(
+            s => s.emitterId === 'player' && s.kind === 'noise'
+        );
+        const recentVisual = (scene.signals ?? []).some(
+            s => s.emitterId === 'player' && s.kind === 'visual'
+        );
+        const crouching = scene.playerCrouching ?? false;
+
+        if (scene.playerMoving && !recentNoise) {
+            let intensity: number, radius: number;
+            if (crouching)           { intensity = 0.1;  radius = 12; }
+            else if (scene.playerSprinting) { intensity = 0.85; radius = 70; }
+            else                     { intensity = 0.4;  radius = 35; }
+            emitSignal(scene, 'noise', scene.playerPos, 'player', intensity, radius, 0.6, { source: 'player', threat: true });
+        }
+
+        if (!recentVisual) {
+            const visIntensity = crouching ? 0.2 : 0.5;
+            const visRadius = crouching ? 12 : 25;
+            emitSignal(scene, 'visual', scene.playerPos, 'player', visIntensity, visRadius, 0.4, { source: 'player', threat: true });
+        }
+    }
 
     const heightMap = scene.heightMap;
     const newEntities: AnimalEntity[] = [];
@@ -335,6 +445,21 @@ export function processFauna(scene: Scene, dt: number) {
         const animal = e as AnimalEntity;
         const species = speciesRegistry.get(animal.speciesId);
         if (!species) continue;
+
+        if (!animal.pendingSignals) animal.pendingSignals = [];
+        if (animal.alertLevel === undefined) animal.alertLevel = 0;
+
+        if (animal.state !== 'dead' && animal.state !== 'sleeping') {
+            const perceived = querySignals(scene, animal.position, species.perception);
+            for (const ps of perceived) {
+                const alreadyPending = animal.pendingSignals.some(
+                    existing => existing.signal.id === ps.signal.id
+                );
+                if (!alreadyPending) {
+                    animal.pendingSignals.push(ps);
+                }
+            }
+        }
 
         if (animal.state === 'dead') {
             animal.age += dt;
@@ -385,18 +510,30 @@ export function processFauna(scene: Scene, dt: number) {
             continue;
         }
 
+        const signalHandled = processAnimalSignals(scene, animal, species, dt);
+        if (animal.state === 'fleeing') {
+            if (animal.targetPos) {
+                moveToward(animal, animal.targetPos, animal.speed, dt);
+            }
+            continue;
+        }
+        if (signalHandled) continue;
+
         const threat = findThreat(scene, animal, species);
         if (threat) {
             const dx = animal.position.x - threat.position.x;
             const dy = animal.position.y - threat.position.y;
             const d = Math.sqrt(dx * dx + dy * dy) || 1;
-            const fleeX = animal.position.x + (dx / d) * species.wanderRadius;
-            const fleeY = animal.position.y + (dy / d) * species.wanderRadius;
-            const clamped = clampToWorld(fleeX, fleeY);
+            const aheadDist = 20;
+            const clamped = clampToWorld(
+                animal.position.x + (dx / d) * aheadDist,
+                animal.position.y + (dy / d) * aheadDist,
+            );
             animal.targetPos = clamped;
             animal.mateTargetId = null;
             animal.state = 'fleeing';
             animal.speed = species.speed * 1.8;
+            animal.idleTimer = FLEE_CALM_TIME;
             moveToward(animal, animal.targetPos, animal.speed, dt);
             continue;
         }
@@ -557,17 +694,6 @@ export function processFauna(scene: Scene, dt: number) {
                     animal.idleTimer = DAYS(0.3 + Math.random() * 0.8);
                     animal.speed = 0;
                 }
-            }
-            continue;
-        }
-
-        if (animal.state === 'fleeing' && animal.targetPos) {
-            const arrived = moveToward(animal, animal.targetPos, animal.speed, dt);
-            if (arrived) {
-                animal.targetPos = null;
-                animal.state = 'idle';
-                animal.idleTimer = DAYS(0.2 + Math.random() * 0.3);
-                animal.speed = 0;
             }
             continue;
         }

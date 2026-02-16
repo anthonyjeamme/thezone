@@ -17,6 +17,7 @@ import { createWeatherState, WEATHER_LABELS, WEATHER_ICONS, WEATHER_TYPES } from
 import type { WeatherType } from '../World/weather';
 import { GameRenderer, createRenderer, getAvailableRenderers, SoilOverlay } from '../Render/GameRenderer';
 import { SOIL_PROPERTIES, SoilProperty } from '../World/fertility';
+import { AmbianceManager } from '../Audio/AmbianceManager';
 
 const SOIL_LAYER_LABELS: Record<SoilProperty, string> = {
     humidity: 'Humidité',
@@ -452,6 +453,8 @@ function generateInitialAnimals(entities: Scene['entities'], heightMap: import('
                 mateTargetId: null,
                 sex: Math.random() < 0.5 ? 'male' : 'female',
                 state: 'idle',
+                pendingSignals: [],
+                alertLevel: 0,
             };
             entities.push(animal);
             placed++;
@@ -517,7 +520,7 @@ function createInitialScene(): Scene {
     generateInitialAnimals(entities, heightMap);
 
     const weather = createWeatherState();
-    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true };
+    const scene: Scene = { entities, time: 8 * SECONDS_PER_HOUR, soilGrid, heightMap, basinMap, depressionMap, weather, lakesEnabled: true, signals: [] };
 
     // initFactions(scene, VILLAGE_CENTERS); // disabled while testing flora
 
@@ -538,6 +541,7 @@ const INITIAL_SCENE = createInitialScene();
 export const Game = () => {
     const containerRef = useRef<HTMLDivElement>(null);
     const rendererRef = useRef<GameRenderer | null>(null);
+    const ambianceRef = useRef<AmbianceManager | null>(null);
     const sceneRef = useRef<Scene>(INITIAL_SCENE);
     const cameraRef = useRef<Camera>({ position: { x: 0, y: 0 } });
     const uiAccRef = useRef(0);
@@ -588,6 +592,18 @@ export const Game = () => {
         renderer.init(container);
         rendererRef.current = renderer;
 
+        if (!ambianceRef.current) {
+            ambianceRef.current = new AmbianceManager();
+        }
+
+        const startAmbiance = () => {
+            ambianceRef.current?.start();
+            document.removeEventListener('click', startAmbiance);
+            document.removeEventListener('keydown', startAmbiance);
+        };
+        document.addEventListener('click', startAmbiance, { once: true });
+        document.addEventListener('keydown', startAmbiance, { once: true });
+
         // Initial resize
         const rect = container.getBoundingClientRect();
         renderer.resize(rect.width, rect.height);
@@ -599,6 +615,8 @@ export const Game = () => {
         return () => {
             rendererRef.current?.destroy();
             rendererRef.current = null;
+            ambianceRef.current?.destroy();
+            ambianceRef.current = null;
         };
     }, []);
 
@@ -663,6 +681,8 @@ export const Game = () => {
                 rainIntensity: sceneRef.current.weather?.rainIntensity ?? 0,
             });
         }
+
+        ambianceRef.current?.update(sceneRef.current, dt);
 
         // Render via the pluggable renderer
         rendererRef.current?.render(sceneRef.current, cameraRef.current, highlightRef.current, soilOverlay);
