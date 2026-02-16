@@ -51,7 +51,9 @@ export function createHeightMap(
     const n1 = createNoise2D(() => rng());
     const n2 = createNoise2D(() => rng());
     const n3 = createNoise2D(() => rng());
+    const n4 = createNoise2D(() => rng());
 
+    const S0 = 0.0004;
     const S1 = 0.0012;
     const S2 = 0.005;
     const S3 = 0.018;
@@ -64,11 +66,12 @@ export function createHeightMap(
             const wx = originX + col * cellSize;
             const wy = originY + row * cellSize;
 
-            const v1 = n1(wx * S1, wy * S1) * 0.6;
-            const v2 = n2(wx * S2, wy * S2) * 0.3;
+            const v0 = n4(wx * S0, wy * S0) * 0.35;
+            const v1 = n1(wx * S1, wy * S1) * 0.35;
+            const v2 = n2(wx * S2, wy * S2) * 0.2;
             const v3 = n3(wx * S3, wy * S3) * 0.1;
 
-            const raw = (v1 + v2 + v3 + 1) * 0.5;
+            const raw = (v0 + v1 + v2 + v3 + 1) * 0.5;
             const h = raw * maxElevation;
 
             data[row * cols + col] = h;
@@ -77,7 +80,40 @@ export function createHeightMap(
         }
     }
 
+    smoothHeightData(data, cols, rows, 2);
+
+    minH = Infinity;
+    maxH = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+        if (data[i] < minH) minH = data[i];
+        if (data[i] > maxH) maxH = data[i];
+    }
+
     return { cols, rows, cellSize, originX, originY, data, minHeight: minH, maxHeight: maxH, seaLevel: SEA_LEVEL };
+}
+
+function smoothHeightData(data: Float32Array, cols: number, rows: number, passes: number): void {
+    const tmp = new Float32Array(data.length);
+    for (let p = 0; p < passes; p++) {
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                let sum = 0;
+                let count = 0;
+                for (let dr = -1; dr <= 1; dr++) {
+                    for (let dc = -1; dc <= 1; dc++) {
+                        const r = row + dr;
+                        const c = col + dc;
+                        if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+                        const w = (dr === 0 && dc === 0) ? 4 : (dr === 0 || dc === 0) ? 2 : 1;
+                        sum += data[r * cols + c] * w;
+                        count += w;
+                    }
+                }
+                tmp[row * cols + col] = sum / count;
+            }
+        }
+        data.set(tmp);
+    }
 }
 
 // =============================================================

@@ -472,7 +472,7 @@ function createInitialScene(): Scene {
     //     generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
     // }
 
-    const CELL_SIZE = 32;
+    const CELL_SIZE = 12;
     const heightMap = createHeightMap(
         -WORLD_HALF, -WORLD_HALF,
         WORLD_HALF * 2, WORLD_HALF * 2,
