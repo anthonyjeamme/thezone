@@ -1,18 +1,19 @@
-// =============================================================
-//  THREE.JS 3D RENDERER — Minecraft-style characters, orbital camera
-// =============================================================
-
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { CSM } from 'three/examples/jsm/csm/CSM.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { GameRenderer, registerRenderer } from '../GameRenderer';
 import {
-    AnimalEntity, BuildingEntity, Camera, CorpseEntity, FertileZoneEntity, FruitEntity,
+    AnimalEntity, BuildingEntity, Camera, CorpseEntity, FruitEntity,
     Highlight, NPCEntity, PlantEntity, ResourceEntity, Scene, StockEntity,
     getCalendar, getLifeStage, LifeStage, WORLD_HALF,
 } from '../../World/types';
 import { getSpecies } from '../../World/flora';
 import { getAnimalSpecies } from '../../World/fauna';
-import { Vector2D } from '../../Shared/vector';
 import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
 import type { SoilGrid, SoilProperty } from '../../World/fertility';
 import { SEA_LEVEL, getLakeAt, getWaterDepthAt } from '../../World/heightmap';
@@ -20,272 +21,25 @@ import type { HeightMap, BasinMap, LakeMap, Lake } from '../../World/heightmap';
 import { getHeightAt } from '../../World/heightmap';
 import type { SoilOverlay } from '../GameRenderer';
 
-// --- Scale: 1 game unit (px) = 0.1 three.js unit ---
-const SCALE = 0.1;
-const HEIGHT_SCALE = SCALE; // height uses same scale
-
-/** Convert 2D world position to 3D, optionally using heightmap */
-let _activeHeightMap: HeightMap | null = null;
-const toWorld = (v: Vector2D) => {
-    const y = _activeHeightMap ? getHeightAt(_activeHeightMap, v.x, v.y) * HEIGHT_SCALE : 0;
-    return new THREE.Vector3(v.x * SCALE, y, v.y * SCALE);
-};
-
-// --- Soil overlay color palettes (same as Canvas2DRenderer) ---
-const SOIL_OVERLAY_COLORS: Record<SoilProperty, { r0: number; g0: number; b0: number; r1: number; g1: number; b1: number }> = {
-    humidity: { r0: 200, g0: 184, b0: 122, r1: 26, g1: 122, b1: 180 },
-    minerals: { r0: 180, g0: 170, b0: 150, r1: 160, g1: 100, b1: 30 },
-    organicMatter: { r0: 200, g0: 190, b0: 170, r1: 40, g1: 30, b1: 10 },
-    sunExposure: { r0: 60, g0: 60, b0: 80, r1: 255, g1: 240, b1: 140 },
-};
-
-// --- NPC sizes by life stage ---
-const NPC_HEIGHT: Record<LifeStage, number> = { baby: 0.4, child: 0.7, adolescent: 1.0, adult: 1.2 };
-const NPC_WIDTH: Record<LifeStage, number> = { baby: 0.25, child: 0.35, adolescent: 0.4, adult: 0.45 };
-
-// =============================================================
-//  INSTANCED RENDERING — shared types & temp objects
-// =============================================================
-
-/** A single visual part of a plant template (e.g., trunk, crown) */
-type PlantPartDef = {
-    geo: THREE.BufferGeometry;
-    mat: THREE.MeshLambertMaterial;
-    offsetY: number; // local Y offset from plant base (before instance scale)
-};
-
-// Reusable temp objects to avoid GC pressure (never create these in a loop)
-const _mat4 = new THREE.Matrix4();
-const _pos3 = new THREE.Vector3();
-const _quat = new THREE.Quaternion(); // identity
-const _scl3 = new THREE.Vector3();
-const _col3 = new THREE.Color();
-
-// =============================================================
-//  MINECRAFT-STYLE CHARACTER BUILDER
-// =============================================================
-
-function createMinecraftCharacter(color: string, stage: LifeStage): THREE.Group {
-    const group = new THREE.Group();
-    const mat = new THREE.MeshLambertMaterial({ color });
-    const skinMat = new THREE.MeshLambertMaterial({ color: '#ffdbac' });
-    const h = NPC_HEIGHT[stage];
-    const w = NPC_WIDTH[stage];
-
-    // --- Head ---
-    const headSize = w * 0.8;
-    const headGeo = new THREE.BoxGeometry(headSize, headSize, headSize);
-    const head = new THREE.Mesh(headGeo, skinMat);
-    head.position.y = h - headSize / 2;
-    head.castShadow = true;
-    group.add(head);
-
-    // --- Eyes ---
-    const eyeMat = new THREE.MeshBasicMaterial({ color: '#222' });
-    const eyeSize = headSize * 0.12;
-    const eyeGeo = new THREE.BoxGeometry(eyeSize, eyeSize * 0.6, eyeSize * 0.3);
-    const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
-    leftEye.position.set(-headSize * 0.2, h - headSize * 0.45, headSize / 2 + 0.01);
-    group.add(leftEye);
-    const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
-    rightEye.position.set(headSize * 0.2, h - headSize * 0.45, headSize / 2 + 0.01);
-    group.add(rightEye);
-
-    // --- Body ---
-    const bodyH = h * 0.35;
-    const bodyW = w * 0.7;
-    const bodyGeo = new THREE.BoxGeometry(bodyW, bodyH, bodyW * 0.6);
-    const body = new THREE.Mesh(bodyGeo, mat);
-    body.position.y = h - headSize - bodyH / 2;
-    body.castShadow = true;
-    group.add(body);
-
-    // --- Arms (pivot at shoulder) ---
-    const armH = bodyH * 0.9;
-    const armW = bodyW * 0.25;
-    const armGeo = new THREE.BoxGeometry(armW, armH, armW);
-    const shoulderY = h - headSize; // top of body = shoulder height
-
-    // Left arm: pivot at shoulder, mesh hangs down
-    const leftArmPivot = new THREE.Group();
-    leftArmPivot.position.set(-(bodyW / 2 + armW / 2), shoulderY, 0);
-    leftArmPivot.name = 'leftArm';
-    const leftArmMesh = new THREE.Mesh(armGeo, mat);
-    leftArmMesh.position.y = -armH / 2; // hang down from shoulder
-    leftArmMesh.castShadow = true;
-    leftArmPivot.add(leftArmMesh);
-    group.add(leftArmPivot);
-
-    // Right arm: pivot at shoulder, mesh hangs down
-    const rightArmPivot = new THREE.Group();
-    rightArmPivot.position.set(bodyW / 2 + armW / 2, shoulderY, 0);
-    rightArmPivot.name = 'rightArm';
-    const rightArmMesh = new THREE.Mesh(armGeo, mat);
-    rightArmMesh.position.y = -armH / 2;
-    rightArmMesh.castShadow = true;
-    rightArmPivot.add(rightArmMesh);
-    group.add(rightArmPivot);
-
-    // --- Legs (pivot at hip) ---
-    const legH = h - headSize - bodyH;
-    const legW = bodyW * 0.35;
-    const legGeo = new THREE.BoxGeometry(legW, legH, legW);
-    const legMat = new THREE.MeshLambertMaterial({ color: '#5a3a1a' });
-    const hipY = h - headSize - bodyH; // bottom of body = hip height
-
-    // Left leg: pivot at hip, mesh hangs down
-    const leftLegPivot = new THREE.Group();
-    leftLegPivot.position.set(-legW * 0.6, hipY, 0);
-    leftLegPivot.name = 'leftLeg';
-    const leftLegMesh = new THREE.Mesh(legGeo, legMat);
-    leftLegMesh.position.y = -legH / 2; // hang down from hip
-    leftLegMesh.castShadow = true;
-    leftLegPivot.add(leftLegMesh);
-    group.add(leftLegPivot);
-
-    // Right leg: pivot at hip, mesh hangs down
-    const rightLegPivot = new THREE.Group();
-    rightLegPivot.position.set(legW * 0.6, hipY, 0);
-    rightLegPivot.name = 'rightLeg';
-    const rightLegMesh = new THREE.Mesh(legGeo, legMat);
-    rightLegMesh.position.y = -legH / 2;
-    rightLegMesh.castShadow = true;
-    rightLegPivot.add(rightLegMesh);
-    group.add(rightLegPivot);
-
-    group.castShadow = true;
-    return group;
-}
-
-// --- Walk animation ---
-function animateWalk(group: THREE.Group, time: number, isMoving: boolean, sprint = false) {
-    const leftArm = group.getObjectByName('leftArm');
-    const rightArm = group.getObjectByName('rightArm');
-    const leftLeg = group.getObjectByName('leftLeg');
-    const rightLeg = group.getObjectByName('rightLeg');
-
-    if (!isMoving) {
-        // Idle pose
-        if (leftArm) leftArm.rotation.x = 0;
-        if (rightArm) rightArm.rotation.x = 0;
-        if (leftLeg) leftLeg.rotation.x = 0;
-        if (rightLeg) rightLeg.rotation.x = 0;
-        return;
-    }
-
-    const freq = sprint ? 14 : 8;
-    const amp = sprint ? 0.85 : 0.6;
-    const swing = Math.sin(time * freq) * amp;
-    if (leftArm) leftArm.rotation.x = swing;
-    if (rightArm) rightArm.rotation.x = -swing;
-    if (leftLeg) leftLeg.rotation.x = -swing;
-    if (rightLeg) rightLeg.rotation.x = swing;
-}
-
-// =============================================================
-//  BUILDING MESH BUILDERS
-// =============================================================
-
-function createCabinMesh(entity: BuildingEntity): THREE.Group {
-    const group = new THREE.Group();
-    const pos = toWorld(entity.position);
-
-    // Walls
-    const wallMat = new THREE.MeshLambertMaterial({ color: '#8B6914' });
-    const wallGeo = new THREE.BoxGeometry(2, 1.5, 2);
-    const walls = new THREE.Mesh(wallGeo, wallMat);
-    walls.position.set(pos.x, 0.75, pos.z);
-    walls.castShadow = true;
-    walls.receiveShadow = true;
-    group.add(walls);
-
-    // Roof (pyramid)
-    const roofGeo = new THREE.ConeGeometry(1.7, 1, 4);
-    const roofMat = new THREE.MeshLambertMaterial({ color: '#5a3a1a' });
-    const roof = new THREE.Mesh(roofGeo, roofMat);
-    roof.position.set(pos.x, 2, pos.z);
-    roof.rotation.y = Math.PI / 4;
-    roof.castShadow = true;
-    group.add(roof);
-
-    // Door
-    const doorMat = new THREE.MeshLambertMaterial({ color: '#3e2507' });
-    const doorGeo = new THREE.BoxGeometry(0.4, 0.7, 0.05);
-    const door = new THREE.Mesh(doorGeo, doorMat);
-    door.position.set(pos.x, 0.35, pos.z + 1.01);
-    group.add(door);
-
-    return group;
-}
-
-function createResourceMesh(entity: ResourceEntity): THREE.Mesh {
-    const pos = toWorld(entity.position);
-    let mesh: THREE.Mesh;
-
-    if (entity.resourceType === 'wood') {
-        // Tree trunk + top
-        const trunkGeo = new THREE.CylinderGeometry(0.1, 0.12, 0.8, 6);
-        const trunkMat = new THREE.MeshLambertMaterial({ color: '#5a3a1a' });
-        const trunk = new THREE.Mesh(trunkGeo, trunkMat);
-        trunk.position.set(pos.x, 0.4, pos.z);
-        trunk.castShadow = true;
-
-        const leavesGeo = new THREE.SphereGeometry(0.35, 6, 6);
-        const leavesMat = new THREE.MeshLambertMaterial({ color: '#2d8c3e' });
-        const leaves = new THREE.Mesh(leavesGeo, leavesMat);
-        leaves.position.set(pos.x, 0.9, pos.z);
-        leaves.castShadow = true;
-
-        // Return trunk as main mesh, attach leaves as child
-        trunk.add(leaves);
-        leaves.position.set(0, 0.5, 0);
-        mesh = trunk;
-    } else if (entity.resourceType === 'water') {
-        const geo = new THREE.SphereGeometry(0.2, 8, 8);
-        const mat = new THREE.MeshLambertMaterial({ color: '#00bcd4', transparent: true, opacity: 0.7 });
-        mesh = new THREE.Mesh(geo, mat);
-        mesh.position.set(pos.x, 0.2, pos.z);
-    } else {
-        // Food: small bush/berry
-        const geo = new THREE.SphereGeometry(0.15, 6, 6);
-        const mat = new THREE.MeshLambertMaterial({ color: '#2ecc71' });
-        mesh = new THREE.Mesh(geo, mat);
-        mesh.position.set(pos.x, 0.15, pos.z);
-        mesh.castShadow = true;
-    }
-
-    return mesh;
-}
-
-function createCorpseMesh(entity: CorpseEntity): THREE.Mesh {
-    const pos = toWorld(entity.position);
-    const geo = new THREE.BoxGeometry(0.6, 0.1, 0.3);
-    const mat = new THREE.MeshLambertMaterial({ color: entity.color, transparent: true, opacity: 0.4 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(pos.x, 0.05, pos.z);
-    return mesh;
-}
-
-function createZoneMesh(entity: FertileZoneEntity): THREE.Mesh {
-    const pos = toWorld(entity.position);
-    const r = entity.radius * SCALE;
-    const geo = new THREE.CircleGeometry(r, 32);
-    const colorMap: Record<string, string> = { food: '#2ecc71', water: '#00bcd4', wood: '#8B6914' };
-    const mat = new THREE.MeshBasicMaterial({
-        color: colorMap[entity.resourceType] ?? '#888',
-        transparent: true,
-        opacity: 0.15,
-        side: THREE.DoubleSide,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.rotation.x = -Math.PI / 2;
-    mesh.position.set(pos.x, 0.02, pos.z);
-    return mesh;
-}
-
-// =============================================================
-//  THREE.JS RENDERER
-// =============================================================
+import {
+    SCALE, HEIGHT_SCALE, SOIL_OVERLAY_COLORS, NPC_HEIGHT,
+    PLAYER_SPEED, PLAYER_SPRINT_MULT, PLAYER_CROUCH_MULT, PLAYER_SWIM_MULT,
+    SWIM_EYE_OFFSET, MOUSE_SENSITIVITY, FP_EYE_HEIGHT, FP_CROUCH_HEIGHT,
+    STAMINA_MAX, STAMINA_DRAIN, STAMINA_REGEN, STAMINA_REGEN_DELAY, STAMINA_EXHAUST_THRESHOLD,
+    GAMEPAD_DEADZONE, GAMEPAD_CAM_SENSITIVITY,
+    INTERACT_RANGE, PICK_DURATION_FRUIT, PICK_DURATION_BUSH, PICK_DURATION_TREE, PICK_DURATION_HERB,
+    TREE_IDS, BUSH_IDS, HERB_IDS,
+    GRASS_CHUNK_SIZE, GRASS_RENDER_RADIUS, GRASS_LOD_BOUNDARY, GRASS_STEP_NEAR, GRASS_STEP_FAR, GRASS_SCALE_FAR,
+    DEBUG_HIDE_GRASS, DEBUG_WIREFRAME,
+} from './constants';
+import { toWorld, setActiveHeightMap, tempMatrix as _mat4, tempPosition as _pos3, tempQuaternion as _quat, tempScale as _scl3, tempColor as _col3 } from './utils';
+import { Vector2D } from '../../Shared/vector';
+import type { PlantPartDef, InteractTarget } from './types';
+import { createMinecraftCharacter, animateWalk } from './CharacterBuilder';
+import { createCabinMesh, createResourceMesh, createCorpseMesh } from './EntityBuilders';
+import { buildAnimalModel } from './AnimalModels';
+import { createTextSprite, updateSpriteText } from './TextSprite';
+import { WeatherSystem } from './WeatherSystem';
 
 class ThreeRenderer implements GameRenderer {
     readonly id = 'three3d';
@@ -317,6 +71,11 @@ class ThreeRenderer implements GameRenderer {
     private fruitRenderedPos = new Map<string, { x: number; y: number; z: number }>();
     private highlightMesh: THREE.Mesh | null = null;
 
+    // Rocks (GLB models)
+    private rockTemplates: (THREE.Group | null)[] = [null, null, null, null];
+    private rockMeshes: THREE.Group[] = [];
+    private rocksBuilt = false;
+
     // Ground
     private ground: THREE.Mesh | null = null;
     private groundTextureApplied = false;
@@ -345,32 +104,13 @@ class ThreeRenderer implements GameRenderer {
     private grassShaderRef: THREE.WebGLProgramParametersWithUniforms | null = null;
     private grassLastCamX = Infinity;
     private grassLastCamZ = Infinity;
-    private static readonly GRASS_CHUNK_SIZE = 80;
-    private static readonly GRASS_RENDER_RADIUS = 550;
-    private static readonly GRASS_LOD_BOUNDARY = 180;
-    private static readonly GRASS_STEP_NEAR = 0.5;
-    private static readonly GRASS_STEP_FAR = 2.5;
-    private static readonly GRASS_SCALE_FAR = 1.6;
-    private static readonly DEBUG_HIDE_GRASS = false;
-    private static readonly DEBUG_WIREFRAME = false;
-    // Sun light
-    private sunLight: THREE.DirectionalLight | null = null;
+    // Cascaded Shadow Maps
+    private csm: CSM | null = null;
+    // Post-processing (AO)
+    private composer: EffectComposer | null = null;
+    private gtaoPass: GTAOPass | null = null;
     // Weather effects
-    private rainMesh: THREE.LineSegments | null = null;
-    private rainPositions: Float32Array | null = null;
-    private static readonly RAIN_COUNT = 20000;
-    private static readonly RAIN_AREA = 40;
-    private static readonly RAIN_HEIGHT_RANGE = 15;
-    private static readonly RAIN_SPEED = 25;
-    private static readonly RAIN_STREAK = 0.35;
-    private snowMesh: THREE.Points | null = null;
-    private snowPositions: Float32Array | null = null;
-    private static readonly SNOW_COUNT = 100000;
-    private static readonly SNOW_AREA = 50;
-    private static readonly SNOW_HEIGHT_RANGE = 30;
-    private static readonly SNOW_SPEED = 2.3;
-    private lightningTimer = 0;
-    private lightningFlash = 0;
+    private weatherSystem: WeatherSystem | null = null;
     private lastRenderTime = -1;
 
     // Third-person player
@@ -382,38 +122,16 @@ class ThreeRenderer implements GameRenderer {
     private keyHandler: ((e: KeyboardEvent) => void) | null = null;
     private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
     // Camera rig — over-the-shoulder TPS
-    private cameraYaw = 0;               // horizontal angle (mouse-controlled)
-    private cameraPitch = 0.12;          // vertical angle (radians, 0 = horizontal)
+    private cameraYaw = 0;
+    private cameraPitch = 0.12;
     private mouseMoveHandler: ((e: MouseEvent) => void) | null = null;
     private pointerLockHandler: (() => void) | null = null;
-    private static readonly PLAYER_SPEED = 0.5;
-    private static readonly PLAYER_SPRINT_MULT = 2.5; // shift = run
-    private static readonly PLAYER_CROUCH_MULT = 0.35;
-    private static readonly PLAYER_SWIM_MULT = 0.4;
-    private static readonly SWIM_EYE_OFFSET = -0.06;
-    private static readonly MOUSE_SENSITIVITY = 0.001;
-    private static readonly FP_EYE_HEIGHT = 0.216;
-    private static readonly FP_CROUCH_HEIGHT = 0.13;
     private crouching = false;
     private swimming = false;
-    private currentEyeHeight = 0.216;
-    // Stamina
-    private static readonly STAMINA_MAX = 100;
-    private static readonly STAMINA_DRAIN = 20;
-    private static readonly STAMINA_REGEN = 12;
-    private static readonly STAMINA_REGEN_DELAY = 1.5;
-    private static readonly STAMINA_EXHAUST_THRESHOLD = 5;
-    private stamina = 100;
+    private currentEyeHeight = FP_EYE_HEIGHT;
+    private stamina = STAMINA_MAX;
     private staminaRegenCooldown = 0;
     private staminaExhausted = false;
-    // Smoothing half-lives (seconds) — lower = snappier
-    private static readonly HL_CAM_POS = 0.01;
-    private static readonly HL_CAM_Y = 0.01;
-    private static readonly HL_MESH_POS = 0.10;
-    private static readonly HL_MESH_Y = 0.16;
-    private static readonly HL_MESH_ROT = 0.08;
-    private static readonly GAMEPAD_DEADZONE = 0.15;
-    private static readonly GAMEPAD_CAM_SENSITIVITY = 2.5;
     // Smoothed camera state
     private smoothCamPos = new THREE.Vector3();
     private smoothTargetPos = new THREE.Vector3();
@@ -423,15 +141,7 @@ class ThreeRenderer implements GameRenderer {
     private cameraInited = false;
 
     // Interaction system
-    private static readonly INTERACT_RANGE = 6;
-    private static readonly PICK_DURATION_FRUIT = 0.6;
-    private static readonly PICK_DURATION_BUSH = 1.5;
-    private static readonly PICK_DURATION_TREE = 4.0;
-    private static readonly PICK_DURATION_HERB = 0.8;
-    private static readonly TREE_IDS = new Set(['oak', 'pine', 'birch', 'willow', 'apple', 'cherry']);
-    private static readonly BUSH_IDS = new Set(['raspberry', 'mushroom']);
-    private static readonly HERB_IDS = new Set(['wheat', 'wildflower', 'thyme', 'sage', 'reed']);
-    private interactTarget: { id: string; type: 'fruit' | 'plant'; pos3: THREE.Vector3; pickDuration: number; label: string } | null = null;
+    private interactTarget: InteractTarget | null = null;
     private pickProgress = 0;
     private picking = false;
     private interactCanvas: HTMLCanvasElement | null = null;
@@ -444,7 +154,7 @@ class ThreeRenderer implements GameRenderer {
         // --- Renderer ---
         this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
         this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        this.renderer.shadowMap.type = THREE.VSMShadowMap;
         this.renderer.setClearColor(0x87ceeb);
         this.renderer.domElement.style.display = 'block';
         this.renderer.domElement.style.width = '100%';
@@ -474,25 +184,32 @@ class ThreeRenderer implements GameRenderer {
         const ambient = new THREE.AmbientLight(0xffffff, 0.5);
         this.threeScene.add(ambient);
 
-        this.sunLight = new THREE.DirectionalLight(0xfff5e0, 1.2);
-        this.sunLight.position.set(30, 50, 20);
-        this.sunLight.castShadow = true;
-        this.sunLight.shadow.mapSize.width = 2048;
-        this.sunLight.shadow.mapSize.height = 2048;
-        this.sunLight.shadow.camera.near = 0.5;
-        this.sunLight.shadow.camera.far = 200;
-        this.sunLight.shadow.camera.left = -80;
-        this.sunLight.shadow.camera.right = 80;
-        this.sunLight.shadow.camera.top = 80;
-        this.sunLight.shadow.camera.bottom = -80;
-        this.threeScene.add(this.sunLight);
+        this.csm = new CSM({
+            camera: this.threeCamera,
+            parent: this.threeScene,
+            cascades: 4,
+            maxFar: 80,
+            mode: 'practical',
+            shadowMapSize: 2048,
+            shadowBias: 0.00015,
+            lightDirection: new THREE.Vector3(-30, -50, -20).normalize(),
+            lightIntensity: 1.2,
+            lightNear: 0.5,
+            lightFar: 300,
+            lightMargin: 50,
+        });
+        this.csm.fade = true;
+        for (const light of this.csm.lights) {
+            light.shadow.radius = 4;
+            light.shadow.blurSamples = 16;
+            light.shadow.normalBias = 0.5;
+        }
 
         // --- Ground detail textures ---
         this.loadGroundDetailTextures();
 
-        // --- Weather particle systems ---
-        this.initRainParticles();
-        this.initSnowParticles();
+        // --- Weather system ---
+        this.weatherSystem = new WeatherSystem(this.threeScene);
 
         // --- Ocean plane (static, large enough to never see edges) ---
         const oceanGeo = new THREE.PlaneGeometry(10000, 10000);
@@ -517,6 +234,7 @@ class ThreeRenderer implements GameRenderer {
         // --- Ground ---
         const groundGeo = new THREE.PlaneGeometry(400, 400);
         const groundMat = new THREE.MeshLambertMaterial({ color: 0x3a7d44 });
+        this.csm.setupMaterial(groundMat);
         this.ground = new THREE.Mesh(groundGeo, groundMat);
         this.ground.rotation.x = -Math.PI / 2;
         this.ground.position.y = -0.5;
@@ -568,6 +286,64 @@ class ThreeRenderer implements GameRenderer {
             this.foliageTextures.set(name, tex);
         }
 
+        // --- Load rock GLB models ---
+        const gltfLoader = new GLTFLoader();
+        for (let i = 1; i <= 4; i++) {
+            const index = i - 1;
+            gltfLoader.load(`/models/rock${i}.glb`, (gltf) => {
+                this.rockTemplates[index] = gltf.scene;
+                this.rockTemplates[index]!.traverse((child) => {
+                    if ((child as THREE.Mesh).isMesh) {
+                        const mesh = child as THREE.Mesh;
+                        mesh.castShadow = true;
+                        mesh.receiveShadow = true;
+                        if (this.csm) {
+                            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                            for (const mat of mats) this.csm.setupMaterial(mat);
+                        }
+                    }
+                });
+            });
+        }
+
+        // --- Post-processing (GTAO Ambient Occlusion) ---
+        this.composer = new EffectComposer(this.renderer);
+        this.composer.addPass(new RenderPass(this.threeScene, this.threeCamera));
+
+        this.gtaoPass = new GTAOPass(this.threeScene, this.threeCamera);
+        this.gtaoPass.output = GTAOPass.OUTPUT.Default;
+        this.gtaoPass.blendIntensity = 0.7;
+        this.gtaoPass.updateGtaoMaterial({
+            radius: 0.4,
+            distanceExponent: 2,
+            thickness: 5,
+            scale: 0.8,
+            samples: 16,
+        });
+        this.gtaoPass.updatePdMaterial({
+            lumaPhi: 10,
+            depthPhi: 2,
+            normalPhi: 3,
+            radius: 16,
+            rings: 4,
+            samples: 24,
+        });
+        const gtaoAny = this.gtaoPass as unknown as { _overrideVisibility: () => void; _visibilityCache: THREE.Object3D[] };
+        const origOverride = gtaoAny._overrideVisibility.bind(this.gtaoPass);
+        this.gtaoPass.overrideVisibility = () => {
+            origOverride();
+            const aoCache = gtaoAny._visibilityCache as THREE.Object3D[];
+            this.threeScene!.traverse((obj: THREE.Object3D) => {
+                if (obj.userData.excludeFromAO && obj.visible) {
+                    obj.visible = false;
+                    aoCache.push(obj);
+                }
+            });
+        };
+        gtaoAny._overrideVisibility = this.gtaoPass.overrideVisibility;
+        this.composer.addPass(this.gtaoPass);
+        this.composer.addPass(new OutputPass());
+
         // --- Keyboard handlers ---
         this.keyHandler = (e: KeyboardEvent) => {
             const k = e.key.toLowerCase();
@@ -581,8 +357,8 @@ class ThreeRenderer implements GameRenderer {
         // --- Mouse look (pointer lock) ---
         this.mouseMoveHandler = (e: MouseEvent) => {
             if (document.pointerLockElement !== this.renderer!.domElement) return;
-            this.cameraYaw -= e.movementX * ThreeRenderer.MOUSE_SENSITIVITY;
-            this.cameraPitch += e.movementY * ThreeRenderer.MOUSE_SENSITIVITY;
+            this.cameraYaw -= e.movementX * MOUSE_SENSITIVITY;
+            this.cameraPitch += e.movementY * MOUSE_SENSITIVITY;
             this.cameraPitch = Math.max(-1.4, Math.min(1.4, this.cameraPitch));
         };
         document.addEventListener('mousemove', this.mouseMoveHandler);
@@ -613,8 +389,7 @@ class ThreeRenderer implements GameRenderer {
     render(scene: Scene, camera: Camera, highlight: Highlight, soilOverlay?: SoilOverlay): void {
         if (!this.renderer || !this.threeScene || !this.threeCamera || !this.controls) return;
 
-        // Set active heightmap so toWorld() uses it
-        _activeHeightMap = scene.heightMap ?? null;
+        setActiveHeightMap(scene.heightMap ?? null);
 
         const elapsed = this.clock.getElapsedTime();
 
@@ -625,7 +400,7 @@ class ThreeRenderer implements GameRenderer {
         }
 
         // --- Stream grass chunks around camera ---
-        if (!ThreeRenderer.DEBUG_HIDE_GRASS && this.groundHeightApplied && scene.soilGrid && scene.heightMap) {
+        if (!DEBUG_HIDE_GRASS && this.groundHeightApplied && scene.soilGrid && scene.heightMap) {
             this.updateGrassChunks(scene);
         }
 
@@ -648,7 +423,9 @@ class ThreeRenderer implements GameRenderer {
 
         const frameDt = this.lastRenderTime >= 0 ? Math.min(elapsed - this.lastRenderTime, 0.1) : 0;
         this.lastRenderTime = elapsed;
-        this.updateWeatherEffects(scene, frameDt);
+        if (this.weatherSystem) {
+            this.weatherSystem.update(scene, frameDt, this.threeCamera, elapsed);
+        }
 
         // --- Sync entities ---
         this.syncPlants(scene);
@@ -666,8 +443,13 @@ class ThreeRenderer implements GameRenderer {
         this.buildLakes(scene);
         this.updateLakeUniforms();
 
+        // --- Build rock decorations (once, after heightmap ready) ---
+        this.buildRocks(scene);
+
         // --- First-person player ---
         this.updatePlayer(scene, frameDt);
+
+        if (this.csm) this.csm.update();
 
         // --- Render (two-pass for water refraction) ---
         if (this.lakeMeshes.length > 0) {
@@ -690,7 +472,11 @@ class ThreeRenderer implements GameRenderer {
                 this.lakeWaterMat.uniforms.uScreenSize.value.set(this.renderer.domElement.width, this.renderer.domElement.height);
             }
         }
-        this.renderer.render(this.threeScene, this.threeCamera);
+        if (this.composer) {
+            this.composer.render();
+        } else {
+            this.renderer.render(this.threeScene, this.threeCamera);
+        }
 
         // --- Interaction HUD (drawn AFTER 3D render) ---
         this.updateInteraction(scene, frameDt);
@@ -707,6 +493,10 @@ class ThreeRenderer implements GameRenderer {
         this.renderer.domElement.style.height = '100%';
         this.threeCamera.aspect = w / h;
         this.threeCamera.updateProjectionMatrix();
+        if (this.composer) {
+            this.composer.setPixelRatio(dpr);
+            this.composer.setSize(w, h);
+        }
         if (this.interactCanvas) {
             this.interactCanvas.width = w * dpr;
             this.interactCanvas.height = h * dpr;
@@ -741,7 +531,7 @@ class ThreeRenderer implements GameRenderer {
         const gamepads = navigator.getGamepads();
         for (const gp of gamepads) {
             if (!gp) continue;
-            const dz = ThreeRenderer.GAMEPAD_DEADZONE;
+            const dz = GAMEPAD_DEADZONE;
             const apply = (v: number) => {
                 if (Math.abs(v) < dz) return 0;
                 return (v - Math.sign(v) * dz) / (1 - dz);
@@ -766,38 +556,38 @@ class ThreeRenderer implements GameRenderer {
         const gp = this.pollGamepad();
         const wantsSprint = !this.crouching && (this.keysDown.has('shift') || gp.sprint);
 
-        if (this.staminaExhausted && this.stamina > ThreeRenderer.STAMINA_EXHAUST_THRESHOLD * 4) {
+        if (this.staminaExhausted && this.stamina > STAMINA_EXHAUST_THRESHOLD * 4) {
             this.staminaExhausted = false;
         }
         const sprinting = wantsSprint && !this.staminaExhausted;
 
         if (sprinting) {
-            this.stamina = Math.max(0, this.stamina - ThreeRenderer.STAMINA_DRAIN * dt);
-            this.staminaRegenCooldown = ThreeRenderer.STAMINA_REGEN_DELAY;
-            if (this.stamina <= ThreeRenderer.STAMINA_EXHAUST_THRESHOLD) {
+            this.stamina = Math.max(0, this.stamina - STAMINA_DRAIN * dt);
+            this.staminaRegenCooldown = STAMINA_REGEN_DELAY;
+            if (this.stamina <= STAMINA_EXHAUST_THRESHOLD) {
                 this.staminaExhausted = true;
             }
         } else {
             this.staminaRegenCooldown = Math.max(0, this.staminaRegenCooldown - dt);
             if (this.staminaRegenCooldown <= 0) {
-                this.stamina = Math.min(ThreeRenderer.STAMINA_MAX, this.stamina + ThreeRenderer.STAMINA_REGEN * dt);
+                this.stamina = Math.min(STAMINA_MAX, this.stamina + STAMINA_REGEN * dt);
             }
         }
 
         const lake = _scene.lakeMap ? getLakeAt(_scene.lakeMap, this.playerPos.x, this.playerPos.y) : null;
-        const terrainAtPlayer = _activeHeightMap ? getHeightAt(_activeHeightMap, this.playerPos.x, this.playerPos.y) : 0;
+        const terrainAtPlayer = _scene.heightMap ? getHeightAt(_scene.heightMap, this.playerPos.x, this.playerPos.y) : 0;
         this.swimming = lake !== null && terrainAtPlayer < lake.waterElevation;
 
         let speedMult = 1;
-        if (this.swimming) speedMult = ThreeRenderer.PLAYER_SWIM_MULT;
-        else if (sprinting) speedMult = ThreeRenderer.PLAYER_SPRINT_MULT;
-        else if (this.crouching) speedMult = ThreeRenderer.PLAYER_CROUCH_MULT;
-        const speed = ThreeRenderer.PLAYER_SPEED * speedMult;
+        if (this.swimming) speedMult = PLAYER_SWIM_MULT;
+        else if (sprinting) speedMult = PLAYER_SPRINT_MULT;
+        else if (this.crouching) speedMult = PLAYER_CROUCH_MULT;
+        const speed = PLAYER_SPEED * speedMult;
 
         let targetEye: number;
-        if (this.swimming) targetEye = ThreeRenderer.FP_EYE_HEIGHT;
-        else if (this.crouching) targetEye = ThreeRenderer.FP_CROUCH_HEIGHT;
-        else targetEye = ThreeRenderer.FP_EYE_HEIGHT;
+        if (this.swimming) targetEye = FP_EYE_HEIGHT;
+        else if (this.crouching) targetEye = FP_CROUCH_HEIGHT;
+        else targetEye = FP_EYE_HEIGHT;
         this.currentEyeHeight += (targetEye - this.currentEyeHeight) * Math.min(1, 12 * dt);
 
         const sinYaw = Math.sin(this.cameraYaw);
@@ -817,8 +607,8 @@ class ThreeRenderer implements GameRenderer {
         inputFwd -= gp.leftY;
         inputRight += gp.leftX;
 
-        this.cameraYaw -= gp.rightX * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
-        this.cameraPitch += gp.rightY * ThreeRenderer.GAMEPAD_CAM_SENSITIVITY * dt;
+        this.cameraYaw -= gp.rightX * GAMEPAD_CAM_SENSITIVITY * dt;
+        this.cameraPitch += gp.rightY * GAMEPAD_CAM_SENSITIVITY * dt;
         this.cameraPitch = Math.max(-1.4, Math.min(1.4, this.cameraPitch));
 
         let moveX = fwdX * inputFwd + rightX * inputRight;
@@ -842,7 +632,7 @@ class ThreeRenderer implements GameRenderer {
         let groundY = pivotW.y;
         if (this.swimming && lake) {
             const waterY = lake.waterElevation * HEIGHT_SCALE;
-            groundY = waterY + ThreeRenderer.SWIM_EYE_OFFSET;
+            groundY = waterY + SWIM_EYE_OFFSET;
         }
         const eyeX = pivotW.x;
         const eyeY = groundY + this.currentEyeHeight;
@@ -875,7 +665,7 @@ class ThreeRenderer implements GameRenderer {
             return;
         }
 
-        const MAX_RAY_DIST = ThreeRenderer.INTERACT_RANGE * SCALE;
+        const MAX_RAY_DIST = INTERACT_RANGE * SCALE;
         const MAX_CROSS_DIST = 0.15;
 
         const rayOrigin = this.threeCamera.position.clone();
@@ -924,17 +714,17 @@ class ThreeRenderer implements GameRenderer {
                 let pickDuration: number;
                 if (e.type === 'fruit') {
                     label = (e as FruitEntity).fruitName;
-                    pickDuration = ThreeRenderer.PICK_DURATION_FRUIT;
+                    pickDuration = PICK_DURATION_FRUIT;
                 } else {
                     const sp = getSpecies(e.speciesId);
                     label = sp ? sp.displayName : e.speciesId;
                     const sid = e.speciesId;
-                    if (ThreeRenderer.TREE_IDS.has(sid)) {
-                        pickDuration = ThreeRenderer.PICK_DURATION_TREE;
-                    } else if (ThreeRenderer.BUSH_IDS.has(sid)) {
-                        pickDuration = ThreeRenderer.PICK_DURATION_BUSH;
+                    if (TREE_IDS.has(sid)) {
+                        pickDuration = PICK_DURATION_TREE;
+                    } else if (BUSH_IDS.has(sid)) {
+                        pickDuration = PICK_DURATION_BUSH;
                     } else {
-                        pickDuration = ThreeRenderer.PICK_DURATION_HERB;
+                        pickDuration = PICK_DURATION_HERB;
                     }
                 }
                 bestEntity = {
@@ -965,7 +755,7 @@ class ThreeRenderer implements GameRenderer {
                 const w3 = toWorld(bestEntity.pos);
                 let plantH = 0.18;
                 const pe = scene.entities.find(en => en.id === bestEntity!.id) as PlantEntity | undefined;
-                if (pe && ThreeRenderer.TREE_IDS.has(pe.speciesId)) {
+                if (pe && TREE_IDS.has(pe.speciesId)) {
                     plantH = 0.4;
                 }
                 targetPos = new THREE.Vector3(w3.x, w3.y + plantH, w3.z);
@@ -1013,10 +803,10 @@ class ThreeRenderer implements GameRenderer {
                     yOff = 0.04;
                 } else {
                     const pe = scene.entities.find(en => en.id === t.id) as PlantEntity | undefined;
-                    if (pe && ThreeRenderer.TREE_IDS.has(pe.speciesId)) {
+                    if (pe && TREE_IDS.has(pe.speciesId)) {
                         outlineScale = 5.0;
                         yOff = 0.35;
-                    } else if (pe && ThreeRenderer.HERB_IDS.has(pe.speciesId)) {
+                    } else if (pe && HERB_IDS.has(pe.speciesId)) {
                         outlineScale = 1.5;
                         yOff = 0.08;
                     }
@@ -1076,7 +866,7 @@ class ThreeRenderer implements GameRenderer {
             ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + gap + armLen);
             ctx.stroke();
 
-            const staminaPct = this.stamina / ThreeRenderer.STAMINA_MAX;
+            const staminaPct = this.stamina / STAMINA_MAX;
             if (staminaPct < 0.8) {
                 const barW = 120 * dpr;
                 const barH = 6 * dpr;
@@ -1249,23 +1039,11 @@ class ThreeRenderer implements GameRenderer {
         if (this.grassPlaneGeo) { this.grassPlaneGeo.dispose(); this.grassPlaneGeo = null; }
         if (this.grassMat) { this.grassMat.dispose(); this.grassMat = null; }
 
-        // Dispose rain mesh
-        if (this.rainMesh) {
-            this.threeScene?.remove(this.rainMesh);
-            this.rainMesh.geometry.dispose();
-            (this.rainMesh.material as THREE.LineBasicMaterial).dispose();
-            this.rainMesh = null;
+        // Dispose weather system
+        if (this.weatherSystem) {
+            this.weatherSystem.destroy();
+            this.weatherSystem = null;
         }
-        this.rainPositions = null;
-
-        // Dispose snow mesh
-        if (this.snowMesh) {
-            this.threeScene?.remove(this.snowMesh);
-            this.snowMesh.geometry.dispose();
-            (this.snowMesh.material as THREE.PointsMaterial).dispose();
-            this.snowMesh = null;
-        }
-        this.snowPositions = null;
 
         // Dispose splatmap resources
         if (this.groundSplatMat) { this.groundSplatMat.dispose(); this.groundSplatMat = null; }
@@ -1279,6 +1057,14 @@ class ThreeRenderer implements GameRenderer {
         if (this.oceanMesh) this.disposeObject(this.oceanMesh);
         this.oceanMesh = null;
 
+        for (const rock of this.rockMeshes) {
+            this.threeScene?.remove(rock);
+            this.disposeObject(rock);
+        }
+        this.rockMeshes = [];
+        this.rocksBuilt = false;
+        this.rockTemplates = [null, null, null, null];
+
         for (const lm of this.lakeMeshes) {
             this.threeScene?.remove(lm);
             this.disposeObject(lm);
@@ -1287,6 +1073,15 @@ class ThreeRenderer implements GameRenderer {
         this.lakesBuilt = false;
         if (this.lakeWaterMat) { this.lakeWaterMat.dispose(); this.lakeWaterMat = null; }
         if (this.refractionRT) { this.refractionRT.dispose(); this.refractionRT = null; }
+
+        if (this.gtaoPass) { this.gtaoPass.dispose(); this.gtaoPass = null; }
+        if (this.composer) { this.composer.dispose(); this.composer = null; }
+
+        if (this.csm) {
+            this.csm.dispose();
+            this.csm.remove();
+            this.csm = null;
+        }
 
         this.controls?.dispose();
         this.renderer?.dispose();
@@ -1306,7 +1101,7 @@ class ThreeRenderer implements GameRenderer {
         return this.renderer?.domElement ?? null;
     }
 
-    screenToWorld(screenX: number, screenY: number, camera: Camera): Vector2D {
+    screenToWorld(screenX: number, screenY: number, _camera: Camera): Vector2D {
         if (!this.renderer || !this.threeCamera) return { x: 0, y: 0 };
 
         const rect = this.renderer.domElement.getBoundingClientRect();
@@ -1340,10 +1135,12 @@ class ThreeRenderer implements GameRenderer {
             map: grassTex,
             alphaTest: 0.35,
             side: THREE.DoubleSide,
+            emissive: 0x3a5a2f,
+            emissiveIntensity: 0.35,
         });
 
-        const fadeStart = ThreeRenderer.GRASS_RENDER_RADIUS * SCALE * 0.55;
-        const fadeEnd = ThreeRenderer.GRASS_RENDER_RADIUS * SCALE * 0.92;
+        const fadeStart = GRASS_RENDER_RADIUS * SCALE * 0.55;
+        const fadeEnd = GRASS_RENDER_RADIUS * SCALE * 0.92;
 
         this.grassMat.onBeforeCompile = (shader) => {
             this.grassShaderRef = shader;
@@ -1412,9 +1209,9 @@ class ThreeRenderer implements GameRenderer {
         basinMap?: BasinMap | null,
         lakeMap?: LakeMap | null,
     ): { instA: THREE.InstancedMesh; instB: THREE.InstancedMesh; instC: THREE.InstancedMesh; lod: number } | null {
-        const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
-        const STEP = lod === 0 ? ThreeRenderer.GRASS_STEP_NEAR : ThreeRenderer.GRASS_STEP_FAR;
-        const SCALE_MULT = lod === 0 ? 1.0 : ThreeRenderer.GRASS_SCALE_FAR;
+        const CS = GRASS_CHUNK_SIZE;
+        const STEP = lod === 0 ? GRASS_STEP_NEAR : GRASS_STEP_FAR;
+        const SCALE_MULT = lod === 0 ? 1.0 : GRASS_SCALE_FAR;
 
         const worldX0 = cx * CS;
         const worldZ0 = cz * CS;
@@ -1471,6 +1268,15 @@ class ThreeRenderer implements GameRenderer {
                 if (waterLvl > 0.08) continue;
                 if (hum < 0.08) continue;
 
+                let nearRock = false;
+                for (const rp of ThreeRenderer.ROCK_POSITIONS) {
+                    const dx = wx - rp.x;
+                    const dz = wz - rp.y;
+                    const r = rp.scale * 1.1;
+                    if (dx * dx + dz * dz < r * r) { nearRock = true; break; }
+                }
+                if (nearRock) continue;
+
                 const humFactor = Math.min(1, Math.max(0, (hum - 0.08) / 0.40));
                 if (rand() > humFactor * humFactor) continue;
                 if (lod === 1 && rand() < 0.12) continue;
@@ -1500,6 +1306,9 @@ class ThreeRenderer implements GameRenderer {
         instA.frustumCulled = false;
         instB.frustumCulled = false;
         instC.frustumCulled = false;
+        instA.userData.excludeFromAO = true;
+        instB.userData.excludeFromAO = true;
+        instC.userData.excludeFromAO = true;
 
         const rA = new THREE.Quaternion();
         const rB = new THREE.Quaternion();
@@ -1556,13 +1365,13 @@ class ThreeRenderer implements GameRenderer {
 
         const dx = camWX - this.grassLastCamX;
         const dz = camWZ - this.grassLastCamZ;
-        if (dx * dx + dz * dz < (ThreeRenderer.GRASS_CHUNK_SIZE * 0.5) ** 2) return;
+        if (dx * dx + dz * dz < (GRASS_CHUNK_SIZE * 0.5) ** 2) return;
         this.grassLastCamX = camWX;
         this.grassLastCamZ = camWZ;
 
-        const CS = ThreeRenderer.GRASS_CHUNK_SIZE;
-        const RADIUS = ThreeRenderer.GRASS_RENDER_RADIUS;
-        const LOD_BOUNDARY = ThreeRenderer.GRASS_LOD_BOUNDARY;
+        const CS = GRASS_CHUNK_SIZE;
+        const RADIUS = GRASS_RENDER_RADIUS;
+        const LOD_BOUNDARY = GRASS_LOD_BOUNDARY;
 
         const chunkRadius = Math.ceil(RADIUS / CS);
         const camCX = Math.floor(camWX / CS);
@@ -1830,6 +1639,10 @@ class ThreeRenderer implements GameRenderer {
             });
         }
 
+        if (this.csm) {
+            for (const p of parts) this.csm.setupMaterial(p.mat);
+        }
+
         this.plantPartCache.set(key, parts);
         return parts;
     }
@@ -1874,6 +1687,8 @@ class ThreeRenderer implements GameRenderer {
                     }
                     const newCap = Math.max(count * 2, 32);
                     inst = new THREE.InstancedMesh(parts[pi].geo, parts[pi].mat, newCap);
+                    inst.castShadow = true;
+                    inst.receiveShadow = true;
                     inst.frustumCulled = false;
                     (inst as unknown as { _cap: number })._cap = newCap;
                     this.threeScene!.add(inst);
@@ -2026,185 +1841,6 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    private static buildRabbitModel(color: string): THREE.Group {
-        const g = new THREE.Group();
-        const mat = new THREE.MeshLambertMaterial({ color });
-
-        const body = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 6), mat);
-        body.scale.set(1, 0.8, 1.3);
-        body.position.y = 0.06;
-        body.castShadow = true;
-        g.add(body);
-
-        const headMat = new THREE.MeshLambertMaterial({ color: '#c0a080' });
-        const head = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 6), headMat);
-        head.position.set(0, 0.09, 0.07);
-        head.castShadow = true;
-        g.add(head);
-
-        const earMat = new THREE.MeshLambertMaterial({ color: '#d4b896' });
-        for (const side of [-1, 1]) {
-            const ear = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.012, 0.06, 5), earMat);
-            ear.position.set(side * 0.02, 0.15, 0.06);
-            ear.rotation.z = side * 0.2;
-            g.add(ear);
-        }
-
-        const tailMat = new THREE.MeshLambertMaterial({ color: '#e0d0c0' });
-        const tail = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 6), tailMat);
-        tail.position.set(0, 0.06, -0.09);
-        g.add(tail);
-
-        return g;
-    }
-
-    private static buildDeerModel(color: string): THREE.Group {
-        const g = new THREE.Group();
-        const mat = new THREE.MeshLambertMaterial({ color });
-
-        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.22, 8), mat);
-        body.rotation.x = Math.PI / 2;
-        body.position.set(0, 0.18, 0);
-        body.castShadow = true;
-        g.add(body);
-
-        const headMat = new THREE.MeshLambertMaterial({ color: '#a08050' });
-        const head = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 6), headMat);
-        head.position.set(0, 0.24, 0.12);
-        head.castShadow = true;
-        g.add(head);
-
-        const legMat = new THREE.MeshLambertMaterial({ color: '#7a5c32' });
-        const legPositions = [
-            { x: -0.04, z: 0.06 }, { x: 0.04, z: 0.06 },
-            { x: -0.04, z: -0.06 }, { x: 0.04, z: -0.06 },
-        ];
-        for (const lp of legPositions) {
-            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.01, 0.14, 5), legMat);
-            leg.position.set(lp.x, 0.07, lp.z);
-            leg.castShadow = true;
-            g.add(leg);
-        }
-
-        const antlerMat = new THREE.MeshLambertMaterial({ color: '#6b5030' });
-        for (const side of [-1, 1]) {
-            const antler = new THREE.Mesh(new THREE.CylinderGeometry(0.005, 0.008, 0.08, 4), antlerMat);
-            antler.position.set(side * 0.025, 0.30, 0.11);
-            antler.rotation.z = side * 0.4;
-            antler.rotation.x = -0.3;
-            g.add(antler);
-
-            const branch = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.005, 0.04, 4), antlerMat);
-            branch.position.set(side * 0.04, 0.34, 0.10);
-            branch.rotation.z = side * 0.8;
-            g.add(branch);
-        }
-
-        return g;
-    }
-
-    private static buildFoxModel(color: string): THREE.Group {
-        const g = new THREE.Group();
-        const mat = new THREE.MeshLambertMaterial({ color });
-
-        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, 0.16, 8), mat);
-        body.rotation.x = Math.PI / 2;
-        body.position.set(0, 0.1, 0);
-        body.castShadow = true;
-        g.add(body);
-
-        const headMat = new THREE.MeshLambertMaterial({ color: '#d06020' });
-        const head = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), headMat);
-        head.position.set(0, 0.13, 0.09);
-        head.castShadow = true;
-        g.add(head);
-
-        const snout = new THREE.Mesh(new THREE.ConeGeometry(0.015, 0.04, 6), headMat);
-        snout.rotation.x = -Math.PI / 2;
-        snout.position.set(0, 0.12, 0.12);
-        g.add(snout);
-
-        const earMat = new THREE.MeshLambertMaterial({ color: '#e07030' });
-        for (const side of [-1, 1]) {
-            const ear = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.03, 4), earMat);
-            ear.position.set(side * 0.02, 0.17, 0.08);
-            g.add(ear);
-        }
-
-        const tailMat = new THREE.MeshLambertMaterial({ color: '#e8a060' });
-        const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.025, 0.1, 6), tailMat);
-        tail.rotation.x = Math.PI / 2 + 0.5;
-        tail.position.set(0, 0.1, -0.11);
-        g.add(tail);
-
-        const whiteTip = new THREE.Mesh(new THREE.SphereGeometry(0.012, 6, 6), new THREE.MeshLambertMaterial({ color: '#ffffff' }));
-        whiteTip.position.set(0, 0.13, -0.15);
-        g.add(whiteTip);
-
-        const legMat = new THREE.MeshLambertMaterial({ color: '#2a2a2a' });
-        for (const lp of [{ x: -0.025, z: 0.04 }, { x: 0.025, z: 0.04 }, { x: -0.025, z: -0.04 }, { x: 0.025, z: -0.04 }]) {
-            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.006, 0.08, 5), legMat);
-            leg.position.set(lp.x, 0.04, lp.z);
-            g.add(leg);
-        }
-
-        return g;
-    }
-
-    private static buildWolfModel(color: string): THREE.Group {
-        const g = new THREE.Group();
-        const mat = new THREE.MeshLambertMaterial({ color });
-
-        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.06, 0.2, 8), mat);
-        body.rotation.x = Math.PI / 2;
-        body.position.set(0, 0.14, 0);
-        body.castShadow = true;
-        g.add(body);
-
-        const headMat = new THREE.MeshLambertMaterial({ color: '#666677' });
-        const head = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6), headMat);
-        head.position.set(0, 0.18, 0.11);
-        head.castShadow = true;
-        g.add(head);
-
-        const snout = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.05, 6), headMat);
-        snout.rotation.x = -Math.PI / 2;
-        snout.position.set(0, 0.16, 0.15);
-        g.add(snout);
-
-        const earMat = new THREE.MeshLambertMaterial({ color: '#555566' });
-        for (const side of [-1, 1]) {
-            const ear = new THREE.Mesh(new THREE.ConeGeometry(0.015, 0.035, 4), earMat);
-            ear.position.set(side * 0.025, 0.23, 0.10);
-            g.add(ear);
-        }
-
-        const tailMat = new THREE.MeshLambertMaterial({ color: '#555566' });
-        const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.025, 0.12, 6), tailMat);
-        tail.rotation.x = Math.PI / 2 + 0.6;
-        tail.position.set(0, 0.14, -0.13);
-        g.add(tail);
-
-        const legMat = new THREE.MeshLambertMaterial({ color: '#444455' });
-        for (const lp of [{ x: -0.03, z: 0.05 }, { x: 0.03, z: 0.05 }, { x: -0.03, z: -0.05 }, { x: 0.03, z: -0.05 }]) {
-            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.01, 0.11, 5), legMat);
-            leg.position.set(lp.x, 0.055, lp.z);
-            g.add(leg);
-        }
-
-        return g;
-    }
-
-    private static buildAnimalModel(speciesId: string, color: string): THREE.Group {
-        switch (speciesId) {
-            case 'rabbit': return ThreeRenderer.buildRabbitModel(color);
-            case 'deer': return ThreeRenderer.buildDeerModel(color);
-            case 'fox': return ThreeRenderer.buildFoxModel(color);
-            case 'wolf': return ThreeRenderer.buildWolfModel(color);
-            default: return ThreeRenderer.buildRabbitModel(color);
-        }
-    }
-
     private syncAnimals(scene: Scene, elapsed: number) {
         const animals = scene.entities.filter((e): e is AnimalEntity => e.type === 'animal');
         const activeIds = new Set(animals.map((a) => a.id));
@@ -2223,7 +1859,7 @@ class ThreeRenderer implements GameRenderer {
 
             let group = this.animalMeshes.get(animal.id);
             if (!group) {
-                group = ThreeRenderer.buildAnimalModel(animal.speciesId, species.color);
+                group = buildAnimalModel(animal.speciesId, species.color);
                 this.threeScene!.add(group);
                 this.animalMeshes.set(animal.id, group);
             }
@@ -2288,7 +1924,7 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    private syncNPCs(scene: Scene, elapsed: number, highlight: Highlight) {
+    private syncNPCs(scene: Scene, elapsed: number, _highlight: Highlight) {
         const npcs = scene.entities.filter((e): e is NPCEntity => e.type === 'npc');
         const activeIds = new Set(npcs.map((n) => n.id));
 
@@ -2467,7 +2103,7 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    private syncZones(_scene: Scene) {
+    private syncZones(__scene: Scene) {
         // Don't render fertile zones in 3D — they clutter the view
         // Clean up any existing zone meshes (e.g. from a previous implementation)
         for (const [id, mesh] of this.zoneMeshes) {
@@ -2533,7 +2169,7 @@ class ThreeRenderer implements GameRenderer {
     }
 
     private updateLighting(nightFactor: number, weather?: { current: string; rainIntensity: number }) {
-        if (!this.sunLight || !this.renderer || !this.threeScene) return;
+        if (!this.csm || !this.renderer || !this.threeScene) return;
 
         const weatherType = weather?.current ?? 'sunny';
 
@@ -2577,8 +2213,9 @@ class ThreeRenderer implements GameRenderer {
             skyColor.lerp(overcastGrey, strength * nightDim);
         }
 
-        if (this.lightningFlash > 0) {
-            skyColor.lerp(new THREE.Color(0xeeeeff), this.lightningFlash * 0.7);
+        const lightningFlash = this.weatherSystem?.getLightningFlash() ?? 0;
+        if (lightningFlash > 0) {
+            skyColor.lerp(new THREE.Color(0xeeeeff), lightningFlash * 0.7);
         }
 
         this.renderer.setClearColor(skyColor);
@@ -2607,17 +2244,21 @@ class ThreeRenderer implements GameRenderer {
         else if (weatherType === 'rainy') sunMult = 0.35;
         else if (weatherType === 'stormy') sunMult = 0.2;
 
-        this.sunLight.intensity = Math.max(0.01, 1.2 * (1 - nightFactor) * sunMult);
-        if (this.lightningFlash > 0) {
-            this.sunLight.intensity += this.lightningFlash * 3.5;
+        let sunIntensity = Math.max(0.01, 1.2 * (1 - nightFactor) * sunMult);
+        if (lightningFlash > 0) {
+            sunIntensity += lightningFlash * 3.5;
         }
 
         const sunDayColor = new THREE.Color(0xfff5e0);
         const sunDuskColor = new THREE.Color(0xff6622);
+        const sunColor = sunDayColor.clone();
         if (nightFactor > 0 && nightFactor < 1) {
-            this.sunLight.color.copy(sunDayColor).lerp(sunDuskColor, nightFactor);
-        } else {
-            this.sunLight.color.copy(sunDayColor);
+            sunColor.lerp(sunDuskColor, nightFactor);
+        }
+
+        for (const light of this.csm.lights) {
+            light.intensity = sunIntensity;
+            light.color.copy(sunColor);
         }
 
         const ambient = this.threeScene.children.find((c) => c instanceof THREE.AmbientLight) as THREE.AmbientLight | undefined;
@@ -2625,8 +2266,8 @@ class ThreeRenderer implements GameRenderer {
             let ambientBase = 0.15 + 0.45 * (1 - nightFactor);
             ambientBase *= (sunMult * 0.6 + 0.4);
             ambientBase = Math.max(0.02, ambientBase);
-            if (this.lightningFlash > 0) {
-                ambientBase += this.lightningFlash * 2.5;
+            if (lightningFlash > 0) {
+                ambientBase += lightningFlash * 2.5;
             }
             ambient.intensity = ambientBase;
         }
@@ -2636,163 +2277,6 @@ class ThreeRenderer implements GameRenderer {
     //  WEATHER EFFECTS — rain particles, lightning
     // =============================================================
 
-    private initRainParticles() {
-        if (!this.threeScene) return;
-        const COUNT = ThreeRenderer.RAIN_COUNT;
-        const positions = new Float32Array(COUNT * 2 * 3);
-        for (let i = 0; i < COUNT; i++) {
-            const x = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
-            const y = Math.random() * ThreeRenderer.RAIN_HEIGHT_RANGE;
-            const z = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
-            positions[i * 6 + 0] = x;
-            positions[i * 6 + 1] = y + ThreeRenderer.RAIN_STREAK;
-            positions[i * 6 + 2] = z;
-            positions[i * 6 + 3] = x;
-            positions[i * 6 + 4] = y;
-            positions[i * 6 + 5] = z;
-        }
-        this.rainPositions = positions;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        const mat = new THREE.LineBasicMaterial({
-            color: 0xaaccff,
-            transparent: true,
-            opacity: 0.3,
-        });
-        this.rainMesh = new THREE.LineSegments(geo, mat);
-        this.rainMesh.frustumCulled = false;
-        this.rainMesh.visible = false;
-        this.threeScene.add(this.rainMesh);
-    }
-
-    private initSnowParticles() {
-        if (!this.threeScene) return;
-        const COUNT = ThreeRenderer.SNOW_COUNT;
-        const positions = new Float32Array(COUNT * 3);
-        for (let i = 0; i < COUNT; i++) {
-            positions[i * 3 + 0] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
-            positions[i * 3 + 1] = Math.random() * ThreeRenderer.SNOW_HEIGHT_RANGE;
-            positions[i * 3 + 2] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
-        }
-        this.snowPositions = positions;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        const mat = new THREE.PointsMaterial({
-            color: 0xffffff,
-            size: 3,
-            sizeAttenuation: false,
-            transparent: true,
-            opacity: 0.85,
-            depthWrite: false,
-        });
-        this.snowMesh = new THREE.Points(geo, mat);
-        this.snowMesh.frustumCulled = false;
-        this.snowMesh.visible = false;
-        this.threeScene.add(this.snowMesh);
-    }
-
-    private updateWeatherEffects(scene: Scene, dt: number) {
-        const weather = scene.weather;
-        const weatherType = weather?.current ?? 'sunny';
-        const intensity = weather?.rainIntensity ?? 0;
-        const isStormy = weatherType === 'stormy';
-        const isSnowy = weatherType === 'snowy';
-        const isRaining = weatherType === 'rainy' || isStormy;
-        const elapsed = this.clock.getElapsedTime();
-
-        if (this.rainMesh && this.rainPositions) {
-            if (!isRaining || intensity <= 0.01) {
-                this.rainMesh.visible = false;
-            } else {
-                this.rainMesh.visible = true;
-                const cam = this.threeCamera!;
-                this.rainMesh.position.set(cam.position.x, 0, cam.position.z);
-
-                const speed = ThreeRenderer.RAIN_SPEED * (0.5 + intensity * 0.5) * (isStormy ? 1.4 : 1);
-                const windX = isStormy
-                    ? Math.sin(elapsed * 0.7) * 6 * dt
-                    : intensity * 1.2 * dt;
-                const activeCount = Math.floor(ThreeRenderer.RAIN_COUNT * intensity);
-
-                for (let i = 0; i < ThreeRenderer.RAIN_COUNT; i++) {
-                    const base = i * 6;
-                    if (i >= activeCount) {
-                        this.rainPositions[base + 1] = -100;
-                        this.rainPositions[base + 4] = -100;
-                        continue;
-                    }
-                    const fall = speed * dt;
-                    this.rainPositions[base + 1] -= fall;
-                    this.rainPositions[base + 4] -= fall;
-                    this.rainPositions[base + 0] += windX;
-                    this.rainPositions[base + 3] += windX;
-
-                    if (this.rainPositions[base + 4] < -1) {
-                        const x = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
-                        const y = ThreeRenderer.RAIN_HEIGHT_RANGE + Math.random() * 3;
-                        const z = (Math.random() - 0.5) * ThreeRenderer.RAIN_AREA;
-                        this.rainPositions[base + 0] = x;
-                        this.rainPositions[base + 1] = y + ThreeRenderer.RAIN_STREAK;
-                        this.rainPositions[base + 2] = z;
-                        this.rainPositions[base + 3] = x;
-                        this.rainPositions[base + 4] = y;
-                        this.rainPositions[base + 5] = z;
-                    }
-                }
-
-                const posAttr = this.rainMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
-                posAttr.needsUpdate = true;
-                const rMat = this.rainMesh.material as THREE.LineBasicMaterial;
-                rMat.opacity = 0.15 + intensity * 0.4;
-            }
-        }
-
-        if (this.snowMesh && this.snowPositions) {
-            const snowIntensity = isSnowy ? intensity : 0;
-            if (snowIntensity <= 0.01) {
-                this.snowMesh.visible = false;
-            } else {
-                this.snowMesh.visible = true;
-                const cam = this.threeCamera!;
-                this.snowMesh.position.set(cam.position.x, cam.position.y - ThreeRenderer.SNOW_HEIGHT_RANGE * 0.4, cam.position.z);
-
-                const activeCount = Math.floor(ThreeRenderer.SNOW_COUNT * snowIntensity);
-                for (let i = 0; i < ThreeRenderer.SNOW_COUNT; i++) {
-                    const base = i * 3;
-                    if (i >= activeCount) {
-                        this.snowPositions[base + 1] = -100;
-                        continue;
-                    }
-                    this.snowPositions[base + 1] -= ThreeRenderer.SNOW_SPEED * dt;
-                    const phase = i * 0.1 + elapsed * 0.5;
-                    this.snowPositions[base + 0] += Math.sin(phase) * 0.8 * dt;
-                    this.snowPositions[base + 2] += Math.cos(phase * 0.7) * 0.6 * dt;
-
-                    if (this.snowPositions[base + 1] < -1) {
-                        this.snowPositions[base + 0] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
-                        this.snowPositions[base + 1] = ThreeRenderer.SNOW_HEIGHT_RANGE + Math.random() * 2;
-                        this.snowPositions[base + 2] = (Math.random() - 0.5) * ThreeRenderer.SNOW_AREA;
-                    }
-                }
-                const posAttr = this.snowMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
-                posAttr.needsUpdate = true;
-                const sMat = this.snowMesh.material as THREE.PointsMaterial;
-                sMat.opacity = 0.5 + snowIntensity * 0.4;
-            }
-        }
-
-        if (isStormy && intensity > 0.3) {
-            this.lightningTimer -= dt;
-            if (this.lightningTimer <= 0) {
-                this.lightningFlash = 0.8 + Math.random() * 0.2;
-                this.lightningTimer = 2 + Math.random() * 7;
-            }
-        }
-        if (this.lightningFlash > 0) {
-            this.lightningFlash -= dt * 5;
-            if (this.lightningFlash < 0) this.lightningFlash = 0;
-        }
-    }
 
     // --- Ground geometry (heightmap) ---
 
@@ -2826,7 +2310,7 @@ class ThreeRenderer implements GameRenderer {
         this.ground.geometry = geo;
         this.ground.position.set(centerX, 0, centerZ);
 
-        if (ThreeRenderer.DEBUG_WIREFRAME && this.threeScene) {
+        if (DEBUG_WIREFRAME && this.threeScene) {
             const wireMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
             const wireMesh = new THREE.Mesh(geo, wireMat);
             wireMesh.rotation.x = -Math.PI / 2;
@@ -2874,7 +2358,11 @@ class ThreeRenderer implements GameRenderer {
         const dirtRef = this.dirtDetailTex;
 
         this.groundSplatMat = new THREE.MeshLambertMaterial({ map: whiteTex });
-        this.groundSplatMat.onBeforeCompile = (shader) => {
+        if (this.csm) this.csm.setupMaterial(this.groundSplatMat);
+        const csmSplatCallback = this.groundSplatMat.onBeforeCompile;
+        this.groundSplatMat.onBeforeCompile = (shader, renderer) => {
+            if (csmSplatCallback) csmSplatCallback.call(this.groundSplatMat, shader, renderer);
+
             this.groundSplatShaderRef = shader;
             shader.uniforms.uGrass = { value: grassRef };
             shader.uniforms.uDirt = { value: dirtRef };
@@ -2902,8 +2390,12 @@ class ThreeRenderer implements GameRenderer {
                     '    vec4 splatSample = texture2D(uSplat, vMapUv);',
                     '    float blend = smoothstep(0.05, 0.95, splatSample.r);',
                     '    float basin = splatSample.g;',
-                    '    float relief = 1.0 - basin * 0.75;',
-                    '    diffuseColor *= mix(dirtC, grassC, blend) * 0.7 * relief;',
+                    '    float relief = 1.0 - basin * 0.5;',
+                    '    vec3 col = mix(dirtC.rgb, grassC.rgb, blend) * relief;',
+                    '    float lum = dot(col, vec3(0.299, 0.587, 0.114));',
+                    '    col = clamp(mix(vec3(lum), col, 1.5), 0.0, 1.0);',
+                    '    col *= col;',
+                    '    diffuseColor.rgb *= col * 1.5;',
                     '}',
                 ].join('\n')
             );
@@ -3134,6 +2626,7 @@ class ThreeRenderer implements GameRenderer {
 
         if (!this.groundOverlayMat) {
             this.groundOverlayMat = new THREE.MeshLambertMaterial({ map: this.groundTexture });
+            if (this.csm) this.csm.setupMaterial(this.groundOverlayMat);
         }
         if (this.ground.material !== this.groundOverlayMat) {
             this.ground.material = this.groundOverlayMat;
@@ -3150,6 +2643,105 @@ class ThreeRenderer implements GameRenderer {
             this.ground.geometry = new THREE.PlaneGeometry(worldW, worldH);
             this.ground.position.set(centerX, 0, centerZ);
         }
+    }
+
+    // --- Rock decorations (static, placed once on terrain) ---
+
+    private static readonly ROCK_POSITIONS: { x: number; y: number; scale: number; rotY: number }[] = [
+        { x: 0, y: 0, scale: 1.5, rotY: 0.0 },
+        { x: 15, y: 10, scale: 1.2, rotY: 1.3 },
+        { x: -20, y: 18, scale: 0.8, rotY: 2.7 },
+        { x: 30, y: -15, scale: 1.8, rotY: 4.2 },
+        { x: -25, y: -30, scale: 1.0, rotY: 5.5 },
+        { x: 40, y: 35, scale: 1.4, rotY: 0.9 },
+        { x: -40, y: 40, scale: 0.7, rotY: 3.1 },
+        { x: 50, y: -25, scale: 1.6, rotY: 1.8 },
+        { x: -35, y: -50, scale: 1.1, rotY: 4.7 },
+        { x: 60, y: 20, scale: 0.9, rotY: 2.3 },
+        { x: -55, y: 15, scale: 1.3, rotY: 5.9 },
+        { x: 25, y: 60, scale: 1.7, rotY: 0.6 },
+        { x: -45, y: -10, scale: 0.8, rotY: 3.8 },
+        { x: 70, y: -40, scale: 1.5, rotY: 1.2 },
+        { x: -60, y: 50, scale: 1.2, rotY: 4.4 },
+        { x: 10, y: -60, scale: 1.0, rotY: 2.9 },
+        { x: -70, y: -20, scale: 1.4, rotY: 5.3 },
+        { x: 80, y: 45, scale: 0.9, rotY: 0.5 },
+        { x: -15, y: 70, scale: 1.6, rotY: 3.5 },
+        { x: 55, y: -55, scale: 1.1, rotY: 1.7 },
+        { x: -80, y: 30, scale: 1.3, rotY: 4.9 },
+        { x: 35, y: 80, scale: 0.8, rotY: 2.1 },
+        { x: -50, y: -70, scale: 1.8, rotY: 5.7 },
+        { x: 90, y: 10, scale: 1.2, rotY: 0.8 },
+        { x: -90, y: -40, scale: 1.5, rotY: 3.2 },
+        { x: 20, y: 90, scale: 0.7, rotY: 1.5 },
+        { x: -30, y: -90, scale: 1.4, rotY: 4.6 },
+        { x: 100, y: 60, scale: 1.0, rotY: 2.4 },
+        { x: -100, y: 70, scale: 1.6, rotY: 5.1 },
+        { x: 75, y: -80, scale: 1.3, rotY: 0.3 },
+        { x: -600, y: -400, scale: 1.2, rotY: 0.0 },
+        { x: -550, y: -380, scale: 0.6, rotY: 1.8 },
+        { x: 400, y: -700, scale: 1.5, rotY: 0.5 },
+        { x: 420, y: -720, scale: 0.7, rotY: 3.1 },
+        { x: -800, y: 200, scale: 1.8, rotY: 2.2 },
+        { x: -780, y: 220, scale: 0.5, rotY: 0.9 },
+        { x: 700, y: 500, scale: 1.0, rotY: 4.0 },
+        { x: 720, y: 480, scale: 0.8, rotY: 1.2 },
+        { x: -200, y: 800, scale: 1.4, rotY: 5.5 },
+        { x: -180, y: 820, scale: 0.6, rotY: 2.7 },
+        { x: 100, y: -300, scale: 2.0, rotY: 3.8 },
+        { x: 120, y: -280, scale: 0.9, rotY: 0.4 },
+        { x: -900, y: -600, scale: 1.3, rotY: 1.5 },
+        { x: -880, y: -620, scale: 0.7, rotY: 4.6 },
+        { x: 600, y: 200, scale: 1.6, rotY: 2.9 },
+        { x: 620, y: 180, scale: 0.5, rotY: 5.1 },
+        { x: -400, y: -900, scale: 1.1, rotY: 0.7 },
+        { x: -380, y: -880, scale: 0.8, rotY: 3.4 },
+        { x: 300, y: 900, scale: 1.7, rotY: 1.0 },
+        { x: 320, y: 880, scale: 0.6, rotY: 4.3 },
+        { x: -100, y: -100, scale: 0.9, rotY: 2.0 },
+        { x: 0, y: 600, scale: 1.3, rotY: 5.8 },
+        { x: -700, y: 700, scale: 1.5, rotY: 0.3 },
+        { x: -680, y: 720, scale: 0.7, rotY: 3.6 },
+        { x: 800, y: -200, scale: 1.2, rotY: 1.7 },
+        { x: 820, y: -220, scale: 0.5, rotY: 4.9 },
+        { x: 500, y: -500, scale: 1.4, rotY: 2.5 },
+        { x: 520, y: -480, scale: 0.8, rotY: 5.3 },
+        { x: -500, y: 500, scale: 1.0, rotY: 0.6 },
+        { x: -480, y: 520, scale: 0.6, rotY: 3.9 },
+        { x: 900, y: 800, scale: 1.8, rotY: 1.3 },
+        { x: 880, y: 780, scale: 0.7, rotY: 4.1 },
+        { x: -300, y: 300, scale: 1.1, rotY: 2.4 },
+        { x: -1000, y: -100, scale: 1.6, rotY: 5.0 },
+        { x: -980, y: -80, scale: 0.5, rotY: 0.8 },
+        { x: 200, y: 400, scale: 1.3, rotY: 3.2 },
+        { x: 220, y: 420, scale: 0.9, rotY: 1.1 },
+        { x: -600, y: 900, scale: 1.5, rotY: 4.7 },
+        { x: -580, y: 920, scale: 0.6, rotY: 2.1 },
+        { x: 950, y: -900, scale: 2.0, rotY: 0.2 },
+    ];
+
+    private buildRocks(scene: Scene) {
+        if (!this.threeScene || !scene.heightMap) return;
+        if (this.rockTemplates.some(t => t === null)) return;
+        if (this.rocksBuilt) return;
+        this.rocksBuilt = true;
+
+        const hm = scene.heightMap;
+
+        ThreeRenderer.ROCK_POSITIONS.forEach((def, index) => {
+            const h = getHeightAt(hm, def.x, def.y) * HEIGHT_SCALE;
+            if (h <= SEA_LEVEL * SCALE + 0.05) return;
+
+            const templateIndex = index % 4;
+            const rock = this.rockTemplates[templateIndex]!.clone();
+            const s = def.scale * 0.15;
+            rock.scale.set(s, s, s);
+            rock.position.set(def.x * SCALE, h - 0.02, def.y * SCALE);
+            rock.rotation.y = def.rotY;
+
+            this.threeScene!.add(rock);
+            this.rockMeshes.push(rock);
+        });
     }
 
     // --- Lake meshes (static water bodies) ---
@@ -3357,56 +2949,6 @@ class ThreeRenderer implements GameRenderer {
             }
         });
     }
-}
-
-// =============================================================
-//  TEXT SPRITE UTILITY
-// =============================================================
-
-function createTextSprite(text: string, color: string): THREE.Sprite {
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 64;
-    const ctx = canvas.getContext('2d')!;
-
-    drawTextToCanvas(ctx, text, color, canvas.width, canvas.height);
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.needsUpdate = true;
-    const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
-    const sprite = new THREE.Sprite(mat);
-    sprite.scale.set(1.5, 0.375, 1);
-    sprite.userData.text = text;
-    return sprite;
-}
-
-function updateSpriteText(sprite: THREE.Sprite, text: string, color: string) {
-    if (sprite.userData.text === text) return;
-    sprite.userData.text = text;
-
-    const mat = sprite.material as THREE.SpriteMaterial;
-    const texture = mat.map;
-    if (!texture || !(texture instanceof THREE.CanvasTexture)) return;
-
-    const canvas = texture.image as HTMLCanvasElement;
-    const ctx = canvas.getContext('2d')!;
-    drawTextToCanvas(ctx, text, color, canvas.width, canvas.height);
-    texture.needsUpdate = true;
-}
-
-function drawTextToCanvas(ctx: CanvasRenderingContext2D, text: string, color: string, w: number, h: number) {
-    ctx.clearRect(0, 0, w, h);
-    ctx.font = 'bold 28px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    // Shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillText(text, w / 2 + 1, h / 2 + 1);
-
-    // Text
-    ctx.fillStyle = color;
-    ctx.fillText(text, w / 2, h / 2);
 }
 
 // --- Register ---

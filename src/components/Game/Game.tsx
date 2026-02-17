@@ -19,6 +19,7 @@ import type { WeatherType } from '../World/weather';
 import { GameRenderer, createRenderer, getAvailableRenderers, SoilOverlay } from '../Render/GameRenderer';
 import { SOIL_PROPERTIES, SoilProperty } from '../World/fertility';
 import { AmbianceManager } from '../Audio/AmbianceManager';
+import { MusicManager } from '../Audio/MusicManager';
 
 const SOIL_LAYER_LABELS: Record<SoilProperty, string> = {
     humidity: 'Humidité',
@@ -293,22 +294,22 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
     // Species configs: id, count, preferred humidity range, growth range
     const speciesSetup: { id: string; count: number; humRange: [number, number]; growthRange: [number, number] }[] = [
         // Forest — dense initial forests
-        { id: 'oak',        count: 120, humRange: [0.30, 0.85], growthRange: [0.5, 1.0] },
-        { id: 'pine',       count: 100, humRange: [0.15, 0.65], growthRange: [0.5, 1.0] },
-        { id: 'birch',      count: 80,  humRange: [0.25, 0.75], growthRange: [0.5, 1.0] },
-        { id: 'mushroom',   count: 40,  humRange: [0.50, 0.85], growthRange: [0.3, 0.9] },
+        { id: 'oak', count: 120, humRange: [0.30, 0.85], growthRange: [0.5, 1.0] },
+        { id: 'pine', count: 100, humRange: [0.15, 0.65], growthRange: [0.5, 1.0] },
+        { id: 'birch', count: 80, humRange: [0.25, 0.75], growthRange: [0.5, 1.0] },
+        { id: 'mushroom', count: 40, humRange: [0.50, 0.85], growthRange: [0.3, 0.9] },
         // Meadow
-        { id: 'wheat',      count: 60,  humRange: [0.30, 0.70], growthRange: [0.2, 0.9] },
-        { id: 'wildflower', count: 50,  humRange: [0.20, 0.75], growthRange: [0.2, 0.8] },
-        { id: 'thyme',      count: 30,  humRange: [0.08, 0.45], growthRange: [0.3, 0.9] },
-        { id: 'sage',       count: 25,  humRange: [0.10, 0.50], growthRange: [0.3, 0.9] },
+        { id: 'wheat', count: 60, humRange: [0.30, 0.70], growthRange: [0.2, 0.9] },
+        { id: 'wildflower', count: 50, humRange: [0.20, 0.75], growthRange: [0.2, 0.8] },
+        { id: 'thyme', count: 30, humRange: [0.08, 0.45], growthRange: [0.3, 0.9] },
+        { id: 'sage', count: 25, humRange: [0.10, 0.50], growthRange: [0.3, 0.9] },
         // Wetland
-        { id: 'willow',     count: 30,  humRange: [0.60, 1.00], growthRange: [0.5, 1.0] },
-        { id: 'reed',       count: 50,  humRange: [0.70, 1.00], growthRange: [0.3, 0.8] },
+        { id: 'willow', count: 30, humRange: [0.60, 1.00], growthRange: [0.5, 1.0] },
+        { id: 'reed', count: 50, humRange: [0.70, 1.00], growthRange: [0.3, 0.8] },
         // Fruit trees & bushes
-        { id: 'raspberry',  count: 50,  humRange: [0.35, 0.80], growthRange: [0.4, 1.0] },
-        { id: 'apple',      count: 40,  humRange: [0.35, 0.75], growthRange: [0.5, 1.0] },
-        { id: 'cherry',     count: 35,  humRange: [0.30, 0.70], growthRange: [0.5, 1.0] },
+        { id: 'raspberry', count: 50, humRange: [0.35, 0.80], growthRange: [0.4, 1.0] },
+        { id: 'apple', count: 40, humRange: [0.35, 0.75], growthRange: [0.5, 1.0] },
+        { id: 'cherry', count: 35, humRange: [0.30, 0.70], growthRange: [0.5, 1.0] },
     ];
 
     for (const setup of speciesSetup) {
@@ -335,8 +336,8 @@ function generateTestPlants(entities: Scene['entities'], soilGrid: import('../Wo
             const growth = gMin + Math.random() * (gMax - gMin);
             const stage = growth < 0.02 ? 'seed' as const
                 : growth < 0.15 ? 'sprout' as const
-                : growth < 0.85 ? 'growing' as const
-                : 'mature' as const;
+                    : growth < 0.85 ? 'growing' as const
+                        : 'mature' as const;
 
             const plant: PlantEntity = {
                 id: `plant-${generateEntityId()}`,
@@ -361,11 +362,11 @@ function generateDenseForests(entities: Scene['entities'], soilGrid: import('../
     const MARGIN = 150;
 
     const forestDefs: { species: string[]; count: number; radius: number; treesPerForest: number; humMin: number }[] = [
-        { species: ['oak', 'birch'],          count: 6,  radius: 80,  treesPerForest: 60, humMin: 0.30 },
-        { species: ['pine'],                  count: 5,  radius: 100, treesPerForest: 70, humMin: 0.15 },
-        { species: ['oak', 'pine', 'birch'],  count: 4,  radius: 120, treesPerForest: 80, humMin: 0.25 },
-        { species: ['willow'],                count: 3,  radius: 50,  treesPerForest: 25, humMin: 0.55 },
-        { species: ['apple', 'cherry'],       count: 3,  radius: 60,  treesPerForest: 30, humMin: 0.30 },
+        { species: ['oak', 'birch'], count: 6, radius: 80, treesPerForest: 60, humMin: 0.30 },
+        { species: ['pine'], count: 5, radius: 100, treesPerForest: 70, humMin: 0.15 },
+        { species: ['oak', 'pine', 'birch'], count: 4, radius: 120, treesPerForest: 80, humMin: 0.25 },
+        { species: ['willow'], count: 3, radius: 50, treesPerForest: 25, humMin: 0.55 },
+        { species: ['apple', 'cherry'], count: 3, radius: 60, treesPerForest: 30, humMin: 0.30 },
     ];
 
     for (const def of forestDefs) {
@@ -423,9 +424,9 @@ function generateInitialAnimals(entities: Scene['entities'], heightMap: import('
     const MARGIN = 100;
     const animalSetup: { id: 'rabbit' | 'deer' | 'fox' | 'wolf'; count: number }[] = [
         { id: 'rabbit', count: 40 },
-        { id: 'deer',   count: 20 },
-        { id: 'fox',    count: 8 },
-        { id: 'wolf',   count: 5 },
+        { id: 'deer', count: 20 },
+        { id: 'fox', count: 8 },
+        { id: 'wolf', count: 5 },
     ];
 
     for (const setup of animalSetup) {
@@ -548,6 +549,7 @@ export const Game = () => {
     const containerRef = useRef<HTMLDivElement>(null);
     const rendererRef = useRef<GameRenderer | null>(null);
     const ambianceRef = useRef<AmbianceManager | null>(null);
+    const musicRef = useRef<MusicManager | null>(null);
     const sceneRef = useRef<Scene>(INITIAL_SCENE);
     const cameraRef = useRef<Camera>({ position: { x: 0, y: 0 } });
     const uiAccRef = useRef(0);
@@ -555,7 +557,7 @@ export const Game = () => {
     const factionAccRef = useRef(0);
 
     // State for UI (no refs read during render)
-    const [speed, setSpeed] = useState(1);
+    const [speed, setSpeed] = useState(0.1);
     const speedRef = useRef(1);
     const [focusedNpcId, setFocusedNpcId] = useState<string | null>(null);
     const focusedNpcIdRef = useRef<string | null>(null);
@@ -602,6 +604,10 @@ export const Game = () => {
             ambianceRef.current = new AmbianceManager();
         }
 
+        if (!musicRef.current) {
+            musicRef.current = new MusicManager();
+        }
+
         const startAmbiance = () => {
             ambianceRef.current?.start();
             document.removeEventListener('click', startAmbiance);
@@ -623,6 +629,8 @@ export const Game = () => {
             rendererRef.current = null;
             ambianceRef.current?.destroy();
             ambianceRef.current = null;
+            musicRef.current?.destroy();
+            musicRef.current = null;
         };
     }, []);
 
@@ -630,6 +638,10 @@ export const Game = () => {
     useEffect(() => {
         if (rendererRef.current?.id !== activeRendererId) {
             initRenderer(activeRendererId);
+        }
+
+        if (musicRef.current) {
+            musicRef.current.setEnabled(activeRendererId === 'three3d');
         }
     }, [activeRendererId, initRenderer]);
 
@@ -689,6 +701,7 @@ export const Game = () => {
         }
 
         ambianceRef.current?.update(sceneRef.current, dt);
+        musicRef.current?.update(dt);
 
         // Render via the pluggable renderer
         rendererRef.current?.render(sceneRef.current, cameraRef.current, highlightRef.current, soilOverlay);
@@ -823,7 +836,7 @@ export const Game = () => {
                 <span {...className('StatItem')}>Vivants: {npcs.length}</span>
                 <span {...className('StatItem')}>Morts: {corpses.length}</span>
                 <div {...className('SpeedControls')}>
-                    {[0.25, 0.5, 1, 5, 10, 20, 50, 100].map((s) => (
+                    {[0.1, 0.25, 0.5, 1, 5, 10, 20, 50, 100].map((s) => (
                         <button
                             key={s}
                             {...className('SpeedBtn', { active: speed === s })}
