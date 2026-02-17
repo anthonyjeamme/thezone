@@ -46,13 +46,18 @@ export const TREE_IDS = new Set(['oak', 'pine', 'birch', 'willow', 'apple', 'che
 export const BUSH_IDS = new Set(['raspberry', 'mushroom']);
 export const HERB_IDS = new Set(['wheat', 'wildflower', 'thyme', 'sage', 'reed']);
 
+export const TREE_LOD0_DIST = 600;
+export const TREE_LOD1_DIST = 1500;
+export const TREE_CULL_DIST = 2400;
+export const PLANT_CULL_DIST = 1050;
+
 export const GRASS_CHUNK_SIZE = 80;
 export const GRASS_RENDER_RADIUS = 550;
 export const GRASS_LOD_BOUNDARY = 180;
 export const GRASS_STEP_NEAR = 0.5;
 export const GRASS_STEP_FAR = 2.5;
 export const GRASS_SCALE_FAR = 1.6;
-export const DEBUG_HIDE_GRASS = false;
+export const DEBUG_HIDE_GRASS = true;
 export const DEBUG_WIREFRAME = false;
 
 export const RAIN_COUNT = 20000;

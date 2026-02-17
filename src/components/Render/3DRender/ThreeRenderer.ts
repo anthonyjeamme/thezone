@@ -14,7 +14,7 @@ import {
 } from '../../World/types';
 import { getSpecies } from '../../World/flora';
 import { getAnimalSpecies } from '../../World/fauna';
-import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX } from '../../World/fertility';
+import { SOIL_TYPE_DEFS, SOIL_TYPE_INDEX, getSoilPropertyAt } from '../../World/fertility';
 import type { SoilGrid, SoilProperty } from '../../World/fertility';
 import { SEA_LEVEL, getLakeAt, getWaterDepthAt } from '../../World/heightmap';
 import type { HeightMap, BasinMap, LakeMap, Lake } from '../../World/heightmap';
@@ -30,6 +30,7 @@ import {
     INTERACT_RANGE, PICK_DURATION_FRUIT, PICK_DURATION_BUSH, PICK_DURATION_TREE, PICK_DURATION_HERB,
     TREE_IDS, BUSH_IDS, HERB_IDS,
     GRASS_CHUNK_SIZE, GRASS_RENDER_RADIUS, GRASS_LOD_BOUNDARY, GRASS_STEP_NEAR, GRASS_STEP_FAR, GRASS_SCALE_FAR,
+    TREE_LOD0_DIST, TREE_LOD1_DIST, TREE_CULL_DIST, PLANT_CULL_DIST,
     DEBUG_HIDE_GRASS, DEBUG_WIREFRAME,
 } from './constants';
 import { toWorld, setActiveHeightMap, tempMatrix as _mat4, tempPosition as _pos3, tempQuaternion as _quat, tempScale as _scl3, tempColor as _col3 } from './utils';
@@ -63,6 +64,9 @@ class ThreeRenderer implements GameRenderer {
     // Instanced rendering pools
     private plantPartCache = new Map<string, PlantPartDef[]>();
     private plantInstances = new Map<string, THREE.InstancedMesh>();
+    private treeInstancedMeshes: { geo: THREE.BufferGeometry; mat: THREE.Material; instance: THREE.InstancedMesh | null }[] = [];
+    private treeLod1Meshes: { geo: THREE.BufferGeometry; mat: THREE.Material; instance: THREE.InstancedMesh | null }[] = [];
+    private treeLod2Meshes: { geo: THREE.BufferGeometry; mat: THREE.Material; instance: THREE.InstancedMesh | null }[] = [];
     private trunkTextures = new Map<string, THREE.Texture>();
     private foliageTextures = new Map<string, THREE.Texture>();
     private fruitGeo: THREE.SphereGeometry | null = null;
@@ -75,6 +79,7 @@ class ThreeRenderer implements GameRenderer {
     private rockTemplates: (THREE.Group | null)[] = [null, null, null, null];
     private rockMeshes: THREE.Group[] = [];
     private rocksBuilt = false;
+    private pineTreeModel: THREE.Group | null = null;
 
     // Ground
     private ground: THREE.Mesh | null = null;
@@ -130,6 +135,7 @@ class ThreeRenderer implements GameRenderer {
     private swimming = false;
     private currentEyeHeight = FP_EYE_HEIGHT;
     private stamina = STAMINA_MAX;
+    private canopyDarkness = 0;
     private staminaRegenCooldown = 0;
     private staminaExhausted = false;
     // Smoothed camera state
@@ -155,6 +161,7 @@ class ThreeRenderer implements GameRenderer {
         this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
         this.renderer.shadowMap.enabled = true;
         this.renderer.shadowMap.type = THREE.VSMShadowMap;
+        this.renderer.sortObjects = true;
         this.renderer.setClearColor(0x87ceeb);
         this.renderer.domElement.style.display = 'block';
         this.renderer.domElement.style.width = '100%';
@@ -163,7 +170,7 @@ class ThreeRenderer implements GameRenderer {
 
         // --- Scene ---
         this.threeScene = new THREE.Scene();
-        this.threeScene.fog = new THREE.Fog(0x87ceeb, 40, 120);
+        this.threeScene.fog = new THREE.Fog(0x87ceeb, 80, 240);
 
         // --- Camera ---
         this.threeCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
@@ -297,14 +304,55 @@ class ThreeRenderer implements GameRenderer {
                         const mesh = child as THREE.Mesh;
                         mesh.castShadow = true;
                         mesh.receiveShadow = true;
-                        if (this.csm) {
-                            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                            for (const mat of mats) this.csm.setupMaterial(mat);
+
+                        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                        for (const mat of mats) {
+                            if ((mat as THREE.MeshStandardMaterial).isMeshStandardMaterial) {
+                                const stdMat = mat as THREE.MeshStandardMaterial;
+                                if (stdMat.color) {
+                                    stdMat.color.multiplyScalar(2.0);
+                                }
+                                stdMat.envMapIntensity = 1.5;
+                                stdMat.needsUpdate = true;
+                            }
+                            if (this.csm) {
+                                this.csm.setupMaterial(mat);
+                            }
                         }
                     }
                 });
             });
         }
+
+        gltfLoader.load('/models/Pine.glb', (gltf) => {
+            this.pineTreeModel = gltf.scene;
+            this.pineTreeModel.traverse((child) => {
+                if ((child as THREE.Mesh).isMesh) {
+                    const mesh = child as THREE.Mesh;
+                    mesh.castShadow = true;
+                    mesh.receiveShadow = true;
+                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of mats) {
+                        mat.side = THREE.DoubleSide;
+                        mat.transparent = false;
+                        mat.depthWrite = true;
+                        mat.depthTest = true;
+                        mat.alphaTest = 0.5;
+                        mat.needsUpdate = true;
+                        if (this.csm) {
+                            this.csm.setupMaterial(mat);
+                        }
+                        this.treeInstancedMeshes.push({
+                            geo: mesh.geometry,
+                            mat: mat,
+                            instance: null
+                        });
+                    }
+                }
+            });
+        });
+
+        this.initTreeLod();
 
         // --- Post-processing (GTAO Ambient Occlusion) ---
         this.composer = new EffectComposer(this.renderer);
@@ -417,9 +465,24 @@ class ThreeRenderer implements GameRenderer {
             this.groundTextureApplied = true;
         }
 
-        // --- Night/day cycle + weather ---
+        // --- Night/day cycle + weather + canopy darkness ---
         const { nightFactor } = getCalendar(scene.time);
-        this.updateLighting(nightFactor, scene.weather);
+
+        let targetCanopyDarkness = 0;
+        if (scene.soilGrid) {
+            const camWX = this.thirdPerson ? this.playerPos.x : this.threeCamera!.position.x / SCALE;
+            const camWZ = this.thirdPerson ? this.playerPos.y : this.threeCamera!.position.z / SCALE;
+            const sunHere = getSoilPropertyAt(scene.soilGrid, camWX, camWZ, 'sunExposure');
+            targetCanopyDarkness = Math.max(0, 1 - sunHere);
+        }
+        const lerpSpeed = 0.08;
+        this.canopyDarkness += (targetCanopyDarkness - this.canopyDarkness) * lerpSpeed;
+
+        if (Math.random() < 0.005) {
+            console.log(`[Canopy] darkness=${this.canopyDarkness.toFixed(3)} target=${targetCanopyDarkness.toFixed(3)}`);
+        }
+
+        this.updateLighting(nightFactor, scene.weather, this.canopyDarkness);
 
         const frameDt = this.lastRenderTime >= 0 ? Math.min(elapsed - this.lastRenderTime, 0.1) : 0;
         this.lastRenderTime = elapsed;
@@ -995,6 +1058,32 @@ class ThreeRenderer implements GameRenderer {
             inst.dispose();
         }
         this.plantInstances.clear();
+        for (const meshData of this.treeInstancedMeshes) {
+            if (meshData.instance) {
+                this.threeScene?.remove(meshData.instance);
+                meshData.instance.dispose();
+                meshData.instance = null;
+            }
+        }
+        this.treeInstancedMeshes = [];
+        for (const meshData of this.treeLod1Meshes) {
+            if (meshData.instance) {
+                this.threeScene?.remove(meshData.instance);
+                meshData.instance.dispose();
+            }
+            meshData.geo.dispose();
+            meshData.mat.dispose();
+        }
+        this.treeLod1Meshes = [];
+        for (const meshData of this.treeLod2Meshes) {
+            if (meshData.instance) {
+                this.threeScene?.remove(meshData.instance);
+                meshData.instance.dispose();
+            }
+            meshData.geo.dispose();
+            meshData.mat.dispose();
+        }
+        this.treeLod2Meshes = [];
         // Dispose cached plant part geometries & materials
         for (const parts of this.plantPartCache.values()) {
             for (const p of parts) { p.geo.dispose(); p.mat.dispose(); }
@@ -1648,15 +1737,155 @@ class ThreeRenderer implements GameRenderer {
     }
 
     // =============================================================
+    //  TREE LOD SYSTEM
+    // =============================================================
+
+    private createTreeCrossGeo(width: number, height: number): THREE.BufferGeometry {
+        const hw = width / 2;
+        const positions = new Float32Array([
+            -hw, 0, 0,   hw, 0, 0,   hw, height, 0,
+            -hw, 0, 0,   hw, height, 0,   -hw, height, 0,
+            0, 0, -hw,   0, 0, hw,   0, height, hw,
+            0, 0, -hw,   0, height, hw,   0, height, -hw,
+        ]);
+        const normals = new Float32Array([
+            0, 0, 1,  0, 0, 1,  0, 0, 1,
+            0, 0, 1,  0, 0, 1,  0, 0, 1,
+            1, 0, 0,  1, 0, 0,  1, 0, 0,
+            1, 0, 0,  1, 0, 0,  1, 0, 0,
+        ]);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+        geo.computeBoundingSphere();
+        return geo;
+    }
+
+    private initTreeLod(): void {
+        const trunkGeo = new THREE.CylinderGeometry(0.1, 0.15, 2.0, 5);
+        trunkGeo.translate(0, 1.0, 0);
+        const trunkMat = new THREE.MeshLambertMaterial({ color: 0x6B4226 });
+
+        const crownGeo = new THREE.ConeGeometry(1.2, 4.0, 5);
+        crownGeo.translate(0, 4.0, 0);
+        const crownMat = new THREE.MeshLambertMaterial({ color: 0x2D5A27 });
+
+        if (this.csm) {
+            this.csm.setupMaterial(trunkMat);
+            this.csm.setupMaterial(crownMat);
+        }
+
+        this.treeLod1Meshes = [
+            { geo: trunkGeo, mat: trunkMat, instance: null },
+            { geo: crownGeo, mat: crownMat, instance: null },
+        ];
+
+        const crossGeo = this.createTreeCrossGeo(2.0, 6.0);
+        const crossMat = new THREE.MeshLambertMaterial({ color: 0x2D5A27, side: THREE.DoubleSide });
+        if (this.csm) this.csm.setupMaterial(crossMat);
+
+        this.treeLod2Meshes = [
+            { geo: crossGeo, mat: crossMat, instance: null },
+        ];
+    }
+
+    private updateTreeLodInstances(
+        meshArray: { geo: THREE.BufferGeometry; mat: THREE.Material; instance: THREE.InstancedMesh | null }[],
+        trees: PlantEntity[],
+        shadows: boolean,
+    ): void {
+        if (trees.length > 0 && meshArray.length > 0) {
+            for (let meshIdx = 0; meshIdx < meshArray.length; meshIdx++) {
+                const meshData = meshArray[meshIdx];
+                let inst = meshData.instance;
+                const capacity = inst ? (inst as unknown as { _cap: number })._cap ?? 0 : 0;
+
+                if (!inst || capacity < trees.length) {
+                    if (inst) {
+                        this.threeScene!.remove(inst);
+                        inst.dispose();
+                    }
+                    const newCap = Math.max(trees.length * 2, 32);
+                    inst = new THREE.InstancedMesh(meshData.geo, meshData.mat, newCap);
+                    inst.castShadow = shadows;
+                    inst.receiveShadow = shadows;
+                    inst.frustumCulled = false;
+                    (inst as unknown as { _cap: number })._cap = newCap;
+                    this.threeScene!.add(inst);
+                    meshData.instance = inst;
+                }
+
+                inst.count = trees.length;
+
+                for (let i = 0; i < trees.length; i++) {
+                    const tree = trees[i];
+                    const s = Math.max(0.15, tree.growth) * 0.5;
+                    const pos = toWorld(tree.position);
+                    _pos3.set(pos.x, pos.y, pos.z);
+                    _scl3.set(s, s, s);
+                    const hash = Math.sin(tree.position.x * 12.9898 + tree.position.y * 78.233) * 43758.5453;
+                    const angle = (hash - Math.floor(hash)) * Math.PI * 2;
+                    _pos3.set(0, 1, 0);
+                    _quat.setFromAxisAngle(_pos3, angle);
+                    _pos3.set(pos.x, pos.y, pos.z);
+                    _mat4.compose(_pos3, _quat, _scl3);
+                    inst.setMatrixAt(i, _mat4);
+                }
+                inst.instanceMatrix.needsUpdate = true;
+                inst.computeBoundingSphere();
+            }
+        } else {
+            for (const meshData of meshArray) {
+                if (meshData.instance) {
+                    this.threeScene!.remove(meshData.instance);
+                    meshData.instance.dispose();
+                    meshData.instance = null;
+                }
+            }
+        }
+    }
+
+    // =============================================================
     //  INSTANCED PLANT SYNC
     // =============================================================
 
     private syncPlants(scene: Scene) {
         const plants = scene.entities.filter((e): e is PlantEntity => e.type === 'plant');
 
-        // Group plants by speciesId-stage
-        const groups = new Map<string, PlantEntity[]>();
+        const camWX = this.thirdPerson ? this.playerPos.x : this.threeCamera!.position.x / SCALE;
+        const camWZ = this.thirdPerson ? this.playerPos.y : this.threeCamera!.position.z / SCALE;
+        const lod0Sq = TREE_LOD0_DIST * TREE_LOD0_DIST;
+        const lod1Sq = TREE_LOD1_DIST * TREE_LOD1_DIST;
+        const cullSq = TREE_CULL_DIST * TREE_CULL_DIST;
+        const plantCullSq = PLANT_CULL_DIST * PLANT_CULL_DIST;
+
+        const lod0Trees: PlantEntity[] = [];
+        const lod1Trees: PlantEntity[] = [];
+        const lod2Trees: PlantEntity[] = [];
+        const nonTrees: PlantEntity[] = [];
         for (const plant of plants) {
+            const dx = plant.position.x - camWX;
+            const dz = plant.position.y - camWZ;
+            const distSq = dx * dx + dz * dz;
+            if (TREE_IDS.has(plant.speciesId)) {
+                if (distSq < lod0Sq) {
+                    lod0Trees.push(plant);
+                } else if (distSq < lod1Sq) {
+                    lod1Trees.push(plant);
+                } else if (distSq < cullSq) {
+                    lod2Trees.push(plant);
+                }
+            } else if (distSq < plantCullSq) {
+                nonTrees.push(plant);
+            }
+        }
+
+        this.updateTreeLodInstances(this.treeInstancedMeshes, lod0Trees, true);
+        this.updateTreeLodInstances(this.treeLod1Meshes, lod1Trees, false);
+        this.updateTreeLodInstances(this.treeLod2Meshes, lod2Trees, false);
+
+        const groups = new Map<string, PlantEntity[]>();
+        for (const plant of nonTrees) {
             if (!getSpecies(plant.speciesId)) continue;
             const key = `${plant.speciesId}-${plant.stage}`;
             let arr = groups.get(key);
@@ -1679,7 +1908,6 @@ class ThreeRenderer implements GameRenderer {
                 let inst = this.plantInstances.get(iKey);
                 const capacity = inst ? (inst as unknown as { _cap: number })._cap ?? 0 : 0;
 
-                // Allocate or grow InstancedMesh when needed
                 if (!inst || capacity < count) {
                     if (inst) {
                         this.threeScene!.remove(inst);
@@ -1711,7 +1939,6 @@ class ThreeRenderer implements GameRenderer {
             }
         }
 
-        // Remove stale instanced meshes
         for (const [key, mesh] of this.plantInstances) {
             if (!activeKeys.has(key)) {
                 this.threeScene!.remove(mesh);
@@ -2168,7 +2395,7 @@ class ThreeRenderer implements GameRenderer {
         }
     }
 
-    private updateLighting(nightFactor: number, weather?: { current: string; rainIntensity: number }) {
+    private updateLighting(nightFactor: number, weather?: { current: string; rainIntensity: number }, canopyDarkness = 0) {
         if (!this.csm || !this.renderer || !this.threeScene) return;
 
         const weatherType = weather?.current ?? 'sunny';
@@ -2176,6 +2403,7 @@ class ThreeRenderer implements GameRenderer {
         const dayColor = new THREE.Color(0x87ceeb);
         const nightColor = new THREE.Color(0x020208);
         const duskColor = new THREE.Color(0xff7b4f);
+        const canopySkyColor = new THREE.Color(0x3a5a3a);
 
         let skyColor: THREE.Color;
         if (nightFactor <= 0) {
@@ -2187,6 +2415,10 @@ class ThreeRenderer implements GameRenderer {
             if (nightFactor > 0.3) {
                 skyColor.lerp(nightColor, (nightFactor - 0.3) / 0.7);
             }
+        }
+
+        if (canopyDarkness > 0.01) {
+            skyColor.lerp(canopySkyColor, canopyDarkness * 0.25);
         }
 
         if (weatherType !== 'sunny') {
@@ -2227,12 +2459,16 @@ class ThreeRenderer implements GameRenderer {
                 fogColor.lerp(nightDark, nightFactor * 0.95);
             }
             this.threeScene.fog.color.copy(fogColor);
-            let fogNear = 40, fogFar = 120;
-            if (weatherType === 'foggy') { fogNear = 1; fogFar = 12; }
-            else if (weatherType === 'stormy') { fogNear = 15; fogFar = 60; }
-            else if (weatherType === 'snowy') { fogNear = 20; fogFar = 80; }
-            else if (weatherType === 'rainy') { fogNear = 30; fogFar = 100; }
-            else if (weatherType === 'cloudy') { fogNear = 60; fogFar = 160; }
+            let fogNear = 80, fogFar = 240;
+            if (weatherType === 'foggy') { fogNear = 2; fogFar = 24; }
+            else if (weatherType === 'stormy') { fogNear = 30; fogFar = 120; }
+            else if (weatherType === 'snowy') { fogNear = 40; fogFar = 160; }
+            else if (weatherType === 'rainy') { fogNear = 60; fogFar = 200; }
+            else if (weatherType === 'cloudy') { fogNear = 120; fogFar = 320; }
+            if (canopyDarkness > 0.05) {
+                fogNear *= (1 - canopyDarkness * 0.3);
+                fogFar *= (1 - canopyDarkness * 0.2);
+            }
             this.threeScene.fog.near += (fogNear - this.threeScene.fog.near) * 0.03;
             this.threeScene.fog.far += (fogFar - this.threeScene.fog.far) * 0.03;
         }
@@ -2244,7 +2480,8 @@ class ThreeRenderer implements GameRenderer {
         else if (weatherType === 'rainy') sunMult = 0.35;
         else if (weatherType === 'stormy') sunMult = 0.2;
 
-        let sunIntensity = Math.max(0.01, 1.2 * (1 - nightFactor) * sunMult);
+        const canopySunDim = 1 - canopyDarkness * 0.4;
+        let sunIntensity = Math.max(0.01, 1.2 * (1 - nightFactor) * sunMult * canopySunDim);
         if (lightningFlash > 0) {
             sunIntensity += lightningFlash * 3.5;
         }
@@ -2265,11 +2502,21 @@ class ThreeRenderer implements GameRenderer {
         if (ambient) {
             let ambientBase = 0.15 + 0.45 * (1 - nightFactor);
             ambientBase *= (sunMult * 0.6 + 0.4);
+            ambientBase *= (1 - canopyDarkness * 0.35);
             ambientBase = Math.max(0.02, ambientBase);
             if (lightningFlash > 0) {
                 ambientBase += lightningFlash * 2.5;
             }
             ambient.intensity = ambientBase;
+
+            if (canopyDarkness > 0.01) {
+                const dayAmbientColor = new THREE.Color(0xffffff);
+                const forestAmbientColor = new THREE.Color(0x6a8a6a);
+                const blended = dayAmbientColor.clone().lerp(forestAmbientColor, canopyDarkness * 0.3);
+                ambient.color.copy(blended);
+            } else {
+                ambient.color.setHex(0xffffff);
+            }
         }
     }
 

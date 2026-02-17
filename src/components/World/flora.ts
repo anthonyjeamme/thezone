@@ -934,13 +934,13 @@ function processFruits(scene: Scene, dt: number) {
 const CANOPY_UPDATE_INTERVAL = 300;
 
 /** Tracks elapsed time since last canopy update */
-let canopyTimer = 0;
+let canopyTimer = CANOPY_UPDATE_INTERVAL;
 
 /** Max shade radius in cells for a fully-grown tree of maxSize=18 */
-const CANOPY_MAX_RADIUS_CELLS = 4;
+const CANOPY_MAX_RADIUS_CELLS = 1;
 
 /** Max sun reduction at center of a fully-grown tree */
-const CANOPY_MAX_SHADE = 0.7;
+const CANOPY_MAX_SHADE = 0.55;
 
 /**
  * Recompute sunExposure for the entire soil grid based on tree canopy.
