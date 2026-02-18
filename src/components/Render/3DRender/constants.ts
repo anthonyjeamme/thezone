@@ -13,6 +13,7 @@ export const SOIL_OVERLAY_COLORS: Record<SoilProperty, { r0: number; g0: number;
 
 export const NPC_HEIGHT: Record<LifeStage, number> = { baby: 0.4, child: 0.7, adolescent: 1.0, adult: 1.2 };
 export const NPC_WIDTH: Record<LifeStage, number> = { baby: 0.25, child: 0.35, adolescent: 0.4, adult: 0.45 };
+export const NPC_RENDER_SCALE = 1 / 4;
 
 export const PLAYER_SPEED = 0.5;
 export const PLAYER_SPRINT_MULT = 2.5;

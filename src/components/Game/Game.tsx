@@ -470,12 +470,11 @@ function generateInitialAnimals(entities: Scene['entities'], heightMap: import('
 function createInitialScene(): Scene {
     const entities: Scene['entities'] = [];
 
-    // --- NPC generation disabled for flora development ---
-    // for (let v = 0; v < VILLAGE_CENTERS.length; v++) {
-    //     const npcCount = 6 + Math.floor(Math.random() * 3);
-    //     generateVillage(VILLAGE_CENTERS[v], npcCount, v, entities);
-    //     generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
-    // }
+    for (let v = 0; v < VILLAGE_CENTERS.length; v++) {
+        const npcCount = 6 + Math.floor(Math.random() * 3);
+        generateVillage(VILLAGE_CENTERS[v], npcCount, v, entities);
+        generateResourceCluster(VILLAGE_CENTERS[v], v, entities);
+    }
 
     const HEIGHTMAP_CELL = 12;
     const SOIL_CELL = 32;

@@ -22,7 +22,7 @@ import { getHeightAt } from '../../World/heightmap';
 import type { SoilOverlay } from '../GameRenderer';
 
 import {
-    SCALE, HEIGHT_SCALE, SOIL_OVERLAY_COLORS, NPC_HEIGHT,
+    SCALE, HEIGHT_SCALE, SOIL_OVERLAY_COLORS, NPC_HEIGHT, NPC_RENDER_SCALE,
     PLAYER_SPEED, PLAYER_SPRINT_MULT, PLAYER_CROUCH_MULT, PLAYER_SWIM_MULT,
     SWIM_EYE_OFFSET, MOUSE_SENSITIVITY, FP_EYE_HEIGHT, FP_CROUCH_HEIGHT,
     STAMINA_MAX, STAMINA_DRAIN, STAMINA_REGEN, STAMINA_REGEN_DELAY, STAMINA_EXHAUST_THRESHOLD,
@@ -80,6 +80,7 @@ class ThreeRenderer implements GameRenderer {
     private rockMeshes: THREE.Group[] = [];
     private rocksBuilt = false;
     private pineTreeModel: THREE.Group | null = null;
+    private houseTemplate: THREE.Group | null = null;
 
     // Ground
     private ground: THREE.Mesh | null = null;
@@ -333,23 +334,51 @@ class ThreeRenderer implements GameRenderer {
                     mesh.receiveShadow = true;
                     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
                     for (const mat of mats) {
-                        mat.side = THREE.DoubleSide;
-                        mat.transparent = false;
-                        mat.depthWrite = true;
-                        mat.depthTest = true;
-                        mat.alphaTest = 0.5;
-                        mat.needsUpdate = true;
+                        const windMat = (mat as THREE.Material).clone();
+                        windMat.side = THREE.DoubleSide;
+                        windMat.transparent = false;
+                        windMat.depthWrite = true;
+                        windMat.depthTest = true;
+                        (windMat as THREE.MeshLambertMaterial).alphaTest = 0.5;
+                        windMat.needsUpdate = true;
                         if (this.csm) {
-                            this.csm.setupMaterial(mat);
+                            this.csm.setupMaterial(windMat);
                         }
+                        this.applyTreeWindMaterial(windMat);
                         this.treeInstancedMeshes.push({
                             geo: mesh.geometry,
-                            mat: mat,
+                            mat: windMat,
                             instance: null
                         });
                     }
                 }
             });
+        });
+
+        gltfLoader.load('/models/house.glb', (gltf) => {
+            this.houseTemplate = gltf.scene;
+            this.houseTemplate.traverse((child) => {
+                if ((child as THREE.Mesh).isMesh) {
+                    const mesh = child as THREE.Mesh;
+                    mesh.castShadow = true;
+                    mesh.receiveShadow = true;
+                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of mats) {
+                        const m = mat as THREE.MeshStandardMaterial;
+                        m.side = THREE.DoubleSide;
+                        m.depthWrite = true;
+                        m.depthTest = true;
+                        if (this.csm) {
+                            this.csm.setupMaterial(mat);
+                        }
+                    }
+                }
+            });
+            for (const [id, mesh] of this.buildingMeshes) {
+                this.threeScene?.remove(mesh);
+                this.disposeObject(mesh);
+            }
+            this.buildingMeshes.clear();
         });
 
         this.initTreeLod();
@@ -456,6 +485,14 @@ class ThreeRenderer implements GameRenderer {
         if (this.grassShaderRef) {
             this.grassShaderRef.uniforms.uWindTime.value = elapsed;
         }
+
+        const treeWindUpdate = (m: { mat: THREE.Material }) => {
+            const u = (m.mat as THREE.Material & { uniforms?: { uTime?: { value: number } } }).uniforms?.uTime;
+            if (u) u.value = elapsed;
+        };
+        this.treeInstancedMeshes.forEach(treeWindUpdate);
+        this.treeLod1Meshes.forEach(treeWindUpdate);
+        this.treeLod2Meshes.forEach(treeWindUpdate);
 
         // --- Update ground texture when overlay changes ---
         const overlay = soilOverlay ?? null;
@@ -1064,6 +1101,7 @@ class ThreeRenderer implements GameRenderer {
                 meshData.instance.dispose();
                 meshData.instance = null;
             }
+            meshData.mat.dispose();
         }
         this.treeInstancedMeshes = [];
         for (const meshData of this.treeLod1Meshes) {
@@ -1153,6 +1191,7 @@ class ThreeRenderer implements GameRenderer {
         this.rockMeshes = [];
         this.rocksBuilt = false;
         this.rockTemplates = [null, null, null, null];
+        this.houseTemplate = null;
 
         for (const lm of this.lakeMeshes) {
             this.threeScene?.remove(lm);
@@ -1740,19 +1779,40 @@ class ThreeRenderer implements GameRenderer {
     //  TREE LOD SYSTEM
     // =============================================================
 
+    private applyTreeWindMaterial(mat: THREE.Material): void {
+        const m = mat as THREE.Material & { uniforms?: Record<string, { value: number }> };
+        m.uniforms = m.uniforms ?? {};
+        m.uniforms.uTime = { value: 0 };
+        mat.onBeforeCompile = (shader) => {
+            shader.uniforms.uTime = m.uniforms!.uTime;
+            shader.vertexShader = 'uniform float uTime;\n' + shader.vertexShader;
+            shader.vertexShader = shader.vertexShader.replace(
+                '#include <begin_vertex>',
+                `#include <begin_vertex>
+                float windY = smoothstep(0.0, 0.5, position.y);
+                float t = uTime;
+                float sway = sin(t * 1.2 + position.y * 1.5) * 0.06 * windY;
+                float sway2 = cos(t * 0.9 + position.y * 1.5) * 0.06 * windY;
+                transformed.x += sway;
+                transformed.z += sway2;
+                `
+            );
+        };
+    }
+
     private createTreeCrossGeo(width: number, height: number): THREE.BufferGeometry {
         const hw = width / 2;
         const positions = new Float32Array([
-            -hw, 0, 0,   hw, 0, 0,   hw, height, 0,
-            -hw, 0, 0,   hw, height, 0,   -hw, height, 0,
-            0, 0, -hw,   0, 0, hw,   0, height, hw,
-            0, 0, -hw,   0, height, hw,   0, height, -hw,
+            -hw, 0, 0, hw, 0, 0, hw, height, 0,
+            -hw, 0, 0, hw, height, 0, -hw, height, 0,
+            0, 0, -hw, 0, 0, hw, 0, height, hw,
+            0, 0, -hw, 0, height, hw, 0, height, -hw,
         ]);
         const normals = new Float32Array([
-            0, 0, 1,  0, 0, 1,  0, 0, 1,
-            0, 0, 1,  0, 0, 1,  0, 0, 1,
-            1, 0, 0,  1, 0, 0,  1, 0, 0,
-            1, 0, 0,  1, 0, 0,  1, 0, 0,
+            0, 0, 1, 0, 0, 1, 0, 0, 1,
+            0, 0, 1, 0, 0, 1, 0, 0, 1,
+            1, 0, 0, 1, 0, 0, 1, 0, 0,
+            1, 0, 0, 1, 0, 0, 1, 0, 0,
         ]);
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -1774,6 +1834,8 @@ class ThreeRenderer implements GameRenderer {
             this.csm.setupMaterial(trunkMat);
             this.csm.setupMaterial(crownMat);
         }
+        this.applyTreeWindMaterial(trunkMat);
+        this.applyTreeWindMaterial(crownMat);
 
         this.treeLod1Meshes = [
             { geo: trunkGeo, mat: trunkMat, instance: null },
@@ -1783,6 +1845,7 @@ class ThreeRenderer implements GameRenderer {
         const crossGeo = this.createTreeCrossGeo(2.0, 6.0);
         const crossMat = new THREE.MeshLambertMaterial({ color: 0x2D5A27, side: THREE.DoubleSide });
         if (this.csm) this.csm.setupMaterial(crossMat);
+        this.applyTreeWindMaterial(crossMat);
 
         this.treeLod2Meshes = [
             { geo: crossGeo, mat: crossMat, instance: null },
@@ -2188,6 +2251,7 @@ class ThreeRenderer implements GameRenderer {
             // Position (Y from heightmap)
             const pos = toWorld(npc.position);
             group.position.set(pos.x, pos.y, pos.z);
+            group.scale.setScalar(NPC_RENDER_SCALE);
 
             // Face movement direction
             if (npc.movement) {
@@ -2212,10 +2276,10 @@ class ThreeRenderer implements GameRenderer {
             // Sleeping: lay down
             if (npc.ai.state === 'sleeping') {
                 group.rotation.z = Math.PI / 2;
-                group.position.y = 0.3;
+                group.position.y = pos.y + 0.1;
             } else {
                 group.rotation.z = 0;
-                group.position.y = 0;
+                group.position.y = pos.y;
             }
 
             // Name label above head
@@ -2284,9 +2348,18 @@ class ThreeRenderer implements GameRenderer {
 
         for (const building of buildings) {
             if (this.buildingMeshes.has(building.id)) continue;
-            const mesh = createCabinMesh(building);
-            this.threeScene!.add(mesh);
-            this.buildingMeshes.set(building.id, mesh);
+            if (this.houseTemplate) {
+                const mesh = this.houseTemplate.clone();
+                const pos = toWorld(building.position);
+                mesh.position.set(pos.x, pos.y, pos.z);
+                mesh.scale.setScalar(NPC_RENDER_SCALE);
+                this.threeScene!.add(mesh);
+                this.buildingMeshes.set(building.id, mesh);
+            } else {
+                const mesh = createCabinMesh(building);
+                this.threeScene!.add(mesh);
+                this.buildingMeshes.set(building.id, mesh);
+            }
         }
     }
 
